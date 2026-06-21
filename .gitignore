@@ -1,0 +1,38 @@
+# RE input — the Windows Telegram build (208 MB binary + modules). Never commit.
+Telegram/
+
+# RE tooling venv + generated caches (regenerate with tools/xrefindex.py)
+tools/.venv/
+.venv/
+*.pkl
+
+# IDA databases
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Build outputs — sources only, no builds
+*.dll
+*.exe
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+build/
+x64/
+Debug/
+Release/
+minhook/
+
+# Flutter / Dart generated
+.dart_tool/
+*.iml
+*.log
+
+# macOS cruft
+.DS_Store
