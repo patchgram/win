@@ -131,7 +131,7 @@ class _PatchDetailState extends State<PatchDetail> {
             border: Border.all(color: PG.border), boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 24)]),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
           Text('Type', style: PG.t(12, color: PG.textDim)), const SizedBox(height: 6),
-          _seg(['All', 'dylib', 'binary'], typeFilter == null ? 0 : (typeFilter == PatchType.dylib ? 1 : 2),
+          _seg(['All', 'dll', 'binary'], typeFilter == null ? 0 : (typeFilter == PatchType.dylib ? 1 : 2),
               (i) => setState(() => typeFilter = i == 0 ? null : (i == 1 ? PatchType.dylib : PatchType.binary))),
           const SizedBox(height: 14),
           Text('Sort', style: PG.t(12, color: PG.textDim)), const SizedBox(height: 6),

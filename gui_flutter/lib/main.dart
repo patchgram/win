@@ -139,8 +139,12 @@ class _ShellState extends State<Shell> {
                   : '${state.productName}${state.productVersion.isEmpty ? '' : ' ${state.productVersion}'}',
               style: PG.t(13, color: PG.mono, mono: true)),
           const SizedBox(height: 6),
-          Text('${state.availableCount} of ${state.totalCount} patches wired for this client version',
-              style: PG.t(12, color: PG.green)),
+          if (state.archUnsupported)
+            Text('⚠ 32-bit (x86) Telegram — not supported.\nInstall the 64-bit (x64) Telegram Desktop.',
+                style: PG.t(12, color: const Color(0xFFFF453A), w: FontWeight.w600))
+          else
+            Text('${state.availableCount} of ${state.totalCount} patches wired for this client version',
+                style: PG.t(12, color: PG.green)),
           const SizedBox(height: 6),
           Text('The selected bundle must be writable before patching.', style: PG.t(12, color: PG.textDim)),
           const _Div(),

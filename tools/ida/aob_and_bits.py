@@ -1,7 +1,8 @@
-import time, struct
+import time, struct, os
 t0=time.time()
 import idapro
-rc=idapro.open_database(r"E:\patchgram\patchgramtest\Telegram.exe", run_auto_analysis=False)
+EXE = os.environ.get("PATCHGRAM_EXE") or os.path.join(os.path.dirname(__file__), "..", "..", "Telegram", "Telegram.exe")
+rc=idapro.open_database(EXE, run_auto_analysis=False)
 print("open rc:", rc, flush=True)
 import ida_segment, idautils, ida_bytes
 BASE=0x140000000

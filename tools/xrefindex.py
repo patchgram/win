@@ -19,8 +19,8 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_OP_MEM, CS_OP_IMM
 import capstone
 RIP = capstone.x86.X86_REG_RIP
 
-EXE = r"E:\patchgram\patchgramtest\Telegram.exe"
-IDX = r"E:\patchgram\win\re\xrefindex.pkl"
+EXE = os.environ.get("PATCHGRAM_EXE") or os.path.join(os.path.dirname(__file__), "..", "Telegram", "Telegram.exe")
+IDX = os.path.join(os.path.dirname(__file__), "xrefindex.pkl")
 
 def load_pe():
     pe = pefile.PE(EXE, fast_load=True)

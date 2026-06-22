@@ -225,7 +225,9 @@ static void patchgram_tl_decode_ctor(uint32_t id, struct PatchgramTLReader *r,
     // so a unique gift appearing before the regular one can't steal the doc.
     if (rw && rw->find_saved_gift) {
         if (rw->sg_gift_len == 0 && !rw->sg_gift_pending && id == PG_TL_STAR_GIFT) {
-            rw->sg_gift_off = rw->last_ctor_start; rw->sg_gift_pending = 1;
+            // Capture the sg_gift_target-th regular starGift (skip the earlier ones, just counting them).
+            if (rw->sg_gift_count == rw->sg_gift_target) { rw->sg_gift_off = rw->last_ctor_start; rw->sg_gift_pending = 1; }
+            rw->sg_gift_count++;
         } else if (rw->sg_gift_pending && rw->sg_doc_len == 0 && !rw->sg_doc_pending && id == PG_TL_DOCUMENT) {
             rw->sg_doc_off = rw->last_ctor_start; rw->sg_doc_pending = 1;
         }
@@ -243,11 +245,20 @@ static void patchgram_tl_decode_ctor(uint32_t id, struct PatchgramTLReader *r,
             if (p->op == PG_TL_FLAGS && id == PG_TL_SAVED_STAR_GIFT) rw->sg_pending_flags_off = r->pos;
             if (rw->sg_gift_pending && rw->sg_auction_off == 0 && id == PG_TL_STAR_GIFT
                 && strcmp(g_tl_strpool + p->name_off, "auction_slug") == 0) rw->sg_auction_off = r->pos;
+            // availability_remains (f0.0) insert boundary — captured at the param index (present or not), so
+            // a non-limited gift can be MADE limited by inserting availability_remains+total right after `stars`.
+            if (rw->sg_gift_pending && rw->sg_avail_off == 0 && id == PG_TL_STAR_GIFT
+                && strcmp(g_tl_strpool + p->name_off, "availability_remains") == 0) rw->sg_avail_off = r->pos;
+            // title (f0.5) insert boundary — shown as the gift name on auction/upgraded gifts.
+            if (rw->sg_gift_pending && rw->sg_title_off == 0 && id == PG_TL_STAR_GIFT
+                && strcmp(g_tl_strpool + p->name_off, "title") == 0) rw->sg_title_off = r->pos;
         }
         // transfer_stars (savedStarGift param 16, f0.8) is AFTER the gift, so capture it once we're past the
         // gift in the target savedStarGift (find_saved_gift is already cleared by then → use sg_post_gift).
         if (rw && rw->sg_post_gift && rw->sg_transfer_off == 0 && id == PG_TL_SAVED_STAR_GIFT
             && strcmp(g_tl_strpool + p->name_off, "transfer_stars") == 0) rw->sg_transfer_off = r->pos;
+        if (rw && rw->sg_post_gift && rw->sg_gift_num_off == 0 && id == PG_TL_SAVED_STAR_GIFT
+            && strcmp(g_tl_strpool + p->name_off, "gift_num") == 0) rw->sg_gift_num_off = r->pos;
         if (p->op == PG_TL_FLAGS) {
             const size_t flags_pos = r->pos;
             uint32_t v = patchgram_tl_u32(r);
@@ -387,26 +398,25 @@ int patchgram_tl_find_saved_gift(const uint8_t *body, size_t bytelen,
     return 1;
 }
 
-// Like find_saved_gift but also returns the caption/auction splice points: the wrapping savedStarGift's flags
-// word offset (to flip message f0.2) and the starGift's auction_slug insert boundary (to insert the trio + flip
-// f0.11). Returns 1 iff the first regular gift was found.
-int patchgram_tl_find_gift_splice(const uint8_t *body, size_t bytelen, size_t *gift_off, size_t *gift_len,
-                                  size_t *flags_off, size_t *auction_off, size_t *transfer_off) {
-    if (gift_off) *gift_off = 0; if (gift_len) *gift_len = 0;
-    if (flags_off) *flags_off = 0; if (auction_off) *auction_off = 0; if (transfer_off) *transfer_off = 0;
-    if (!body || bytelen < 16) { return 0; }
+// Find the (gift_index)-th regular starGift + all its splice points (see PgGiftSplice). One read-only walk.
+int patchgram_tl_find_gift_n(const uint8_t *body, size_t bytelen, int gift_index, struct PgGiftSplice *out) {
+    if (out) memset(out, 0, sizeof *out);
+    if (!body || bytelen < 16 || !out || gift_index < 0) { return 0; }
     struct PatchgramTLRewrite rw; memset(&rw, 0, sizeof rw);
     rw.base = (uint8_t *)body;
     rw.find_saved_gift = 1;
+    rw.sg_gift_target = gift_index;
     struct PatchgramTLReader r = { body, bytelen, 0, false };
     struct PatchgramTLOut o = { NULL, 0, 0, false };
     uint32_t top = patchgram_tl_u32(&r);
     if (r.err || top != PG_TL_PAYMENTS_SAVED_STAR_GIFTS) { return 0; }
     patchgram_tl_decode_ctor(top, &r, &o, 0, false, &rw);
-    if (rw.sg_gift_len == 0) { return 0; }
-    if (gift_off) *gift_off = rw.sg_gift_off; if (gift_len) *gift_len = rw.sg_gift_len;
-    if (flags_off) *flags_off = rw.sg_flags_off; if (auction_off) *auction_off = rw.sg_auction_off;
-    if (transfer_off) *transfer_off = rw.sg_transfer_off;
+    if (rw.sg_gift_len == 0) { return 0; }                       // no gift at that index
+    out->found = 1;
+    out->gift_off = rw.sg_gift_off; out->gift_len = rw.sg_gift_len;
+    out->sg_flags_off = rw.sg_flags_off;
+    out->avail_off = rw.sg_avail_off; out->title_off = rw.sg_title_off; out->auction_off = rw.sg_auction_off;
+    out->transfer_off = rw.sg_transfer_off; out->gift_num_off = rw.sg_gift_num_off;
     return 1;
 }
 

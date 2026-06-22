@@ -64,8 +64,25 @@ struct PatchgramTLRewrite {
     size_t   sg_flags_off;             // the wrapping savedStarGift's flags word offset (to flip message f0.2)
     size_t   sg_pending_flags_off;     // walk state: current savedStarGift's flags offset
     size_t   sg_auction_off;           // the starGift's auction_slug insert offset (param boundary)
+    size_t   sg_avail_off;             // the starGift's availability_remains insert offset (param boundary, f0.0)
+    size_t   sg_title_off;             // the starGift's title insert offset (param boundary, f0.5)
     int      sg_post_gift;             // walk state: inside the target savedStarGift, AFTER its gift field
     size_t   sg_transfer_off;          // the savedStarGift's transfer_stars insert offset (param boundary, f0.8)
+    size_t   sg_gift_num_off;          // the savedStarGift's gift_num insert offset (param boundary, f0.19)
+    int      sg_gift_target;           // INPUT: which regular starGift (0-based) to capture (0 = first)
+    int      sg_gift_count;            // walk state: regular starGifts seen so far
+};
+
+// One regular gift's splice points within a payments.savedStarGifts response (byte offsets into the reply).
+struct PgGiftSplice {
+    int      found;
+    size_t   gift_off, gift_len;       // the starGift object span (gift_off+gift_len = message/caption insert point)
+    size_t   sg_flags_off;             // wrapping savedStarGift flags word (message f0.2, transfer f0.8, gift_num f0.19)
+    size_t   avail_off;                // starGift availability_remains boundary (f0.0)
+    size_t   title_off;                // starGift title boundary (f0.5)
+    size_t   auction_off;              // starGift auction_slug boundary (f0.11)
+    size_t   transfer_off;             // savedStarGift transfer_stars boundary (f0.8)
+    size_t   gift_num_off;             // savedStarGift gift_num boundary (f0.19)
 };
 
 // Walk a payments.savedStarGifts response IN PLACE, overwriting the configured scalar fields of each
@@ -76,8 +93,9 @@ int patchgram_tl_rewrite_saved_star_gifts(uint8_t *body, size_t bytelen, struct 
 // gift's sticker Document span. Returns 1 iff a regular gift was found (gift_len>0). doc_len may be 0.
 int patchgram_tl_find_saved_gift(const uint8_t *body, size_t bytelen,
                                  size_t *gift_off, size_t *gift_len, size_t *doc_off, size_t *doc_len);
-int patchgram_tl_find_gift_splice(const uint8_t *body, size_t bytelen, size_t *gift_off, size_t *gift_len,
-                                  size_t *flags_off, size_t *auction_off, size_t *transfer_off);
+// Find the (gift_index)-th regular starGift in a payments.savedStarGifts reply + all its splice points.
+// Returns 1 iff that gift exists (out->found set). gift_index 0 = the first gift (newest = top of the UI).
+int patchgram_tl_find_gift_n(const uint8_t *body, size_t bytelen, int gift_index, struct PgGiftSplice *out);
 
 // Capture helpers for the hidden-gifts rebuilder (read-only walks; return 1 on success):
 //  - doc_thumbs: locate a Document's `thumbs` field span (used to slim a cloned sticker doc).

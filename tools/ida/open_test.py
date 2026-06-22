@@ -1,7 +1,8 @@
-import time, idapro
+import time, os, idapro
+EXE = os.environ.get("PATCHGRAM_EXE") or os.path.join(os.path.dirname(__file__), "..", "..", "Telegram", "Telegram.exe")
 t = time.time()
 # open WITHOUT auto-analysis first — just confirm idalib loads this 208 MB PE.
-rc = idapro.open_database(r"E:\patchgram\patchgramtest\Telegram.exe", run_auto_analysis=False)
+rc = idapro.open_database(EXE, run_auto_analysis=False)
 print("open rc:", rc, "in %.1fs" % (time.time() - t))
 import ida_segment, ida_funcs
 print("segments:", ida_segment.get_segm_qty(), "funcs(pre-analysis):", ida_funcs.get_func_qty())

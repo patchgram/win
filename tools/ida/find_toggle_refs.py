@@ -2,13 +2,13 @@
 # Find ALL code (any instruction form) referencing the OptionUnlimitedRecentStickers toggle object
 # range [0xd3db610, 0xd3db690] — disassembling each .pdata function correctly from its start (a linear
 # whole-.text sweep mis-aligns on data and misses things). Prints ref addr + enclosing function.
-import struct, bisect, sys
+import struct, bisect, sys, os
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_OP_MEM
 import capstone
 RIP = capstone.x86.X86_REG_RIP
 
-EXE = r"E:\patchgram\patchgramtest\Telegram.exe"
+EXE = os.environ.get("PATCHGRAM_EXE") or os.path.join(os.path.dirname(__file__), "..", "..", "Telegram", "Telegram.exe")
 LO, HI = 0xd3db600, 0xd3db698     # toggle object range (RVAs)
 
 pe = pefile.PE(EXE, fast_load=True); base = pe.OPTIONAL_HEADER.ImageBase; data = pe.__data__

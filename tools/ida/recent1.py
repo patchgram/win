@@ -1,5 +1,6 @@
-import idapro
-idapro.open_database(r"E:\patchgram\patchgramtest\Telegram.exe", run_auto_analysis=False)
+import os, idapro
+EXE = os.environ.get("PATCHGRAM_EXE") or os.path.join(os.path.dirname(__file__), "..", "..", "Telegram", "Telegram.exe")
+idapro.open_database(EXE, run_auto_analysis=False)
 import ida_funcs, ida_auto, ida_hexrays, idc, ida_bytes, idautils
 
 ida_hexrays.init_hexrays_plugin()

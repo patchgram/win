@@ -1,0 +1,112 @@
+# Patchgram Patch List
+
+This file describes the patches available in Patchgram in plain language.
+
+## Patch Types
+
+| Type | What it means | When it is used |
+| --- | --- | --- |
+| `dll` | Patchgram injects its runtime hook library `Patchgram.dll` into Telegram Desktop and changes behavior while the app is running. | Visual/local features, configurable values, and patches that should be updated without rewriting many executable bytes. |
+| `binary` | Patchgram edits matched byte patterns in `Telegram.exe`. | Stable request/constructor patches and local checks that are easier to change directly in the binary. |
+
+> Most patches are local client-side changes. They change what your Telegram Desktop sends, blocks, or displays locally. They do not change Telegram server-side account data.
+
+## Patches
+
+Patchgram's main screen groups patches into five sections — **Accounts**, **Messages**, **Optimizations**, **Gifts**, and **Misc**. Each patch below is listed under the section it appears in.
+
+### Accounts
+
+| Patch | Type | What it does |
+| --- | --- | --- |
+| Always offline | `dll` | Keeps your account shown as offline by forcing the local `account.updateStatus` offline value. |
+| Don't share phone when adding contacts | `dll` | Prevents Telegram Desktop from sending the phone privacy exception flag when adding a contact. |
+| 999 accounts | `binary` | Raises the local account limit from Telegram Desktop's normal limit to 999 accounts. |
+| Hide self phone | `dll` | Returns an empty profile phone value for your own user, hiding the phone row in the self-profile. |
+| Custom account settings | `dll` | A grouped local account customization patch. It contains visual balance, level rating, badge, bot verification, Premium, identity, attached channel, Fragment phone, custom usernames, and account freeze subpatches. The account freeze subpatch makes Telegram Desktop show the account as frozen by injecting freeze dates and an appeal URL into the local `help.appConfig` response. |
+
+### Messages
+
+| Patch | Type | What it does |
+| --- | --- | --- |
+| Message settings | `dll` | A grouped privacy patch for typing activity, read receipts, local drafts, local channel post Fact Check text, copy/save protect, and TTL. |
+| Show bot callback-data on hover | `binary` | Shows bot button callback data locally when hovering/copying inline button text. |
+| Sensitive blur | `binary` | Disables local sensitive-content blur checks. |
+| More recent stickers | `binary` | Raises the recent stickers display limit from Telegram's default 20 to 200, so the "Recent" row in the sticker panel shows many more recently-used stickers. Runtime memory patch on `kRecentDisplayLimit` in `StickersListWidget::collectRecentStickers`. |
+| Open links without warning | `binary` | Opens hidden/external links without Telegram's extra confirmation warning. |
+| Disable media spoilers | `binary` | Shows spoiler-marked photos/videos normally instead of blurring them locally. |
+
+### Optimizations
+
+| Patch | Type | What it does |
+| --- | --- | --- |
+| Disable Premium, Stars, TON & Gifts | `dll` | Disables selected monetization UI and request paths at runtime: Premium, Stars, TON, Gifts, boosts, paid reactions, emoji statuses, and related app config parts. |
+| Disable premium effects | `binary` | Stops Premium sticker/effect animations from starting locally. |
+| Hide stories | `dll` | Hides story state locally and blocks known story fetch/read/view request paths. |
+| Disable ads | `dll` | Blocks Telegram Ads and proxy sponsor promotion surfaces. |
+
+### Gifts
+
+All Gifts patches are `dll`: they work at runtime by rewriting the `payments.savedStarGifts` / `payments.starGifts` responses inside `Patchgram.dll`. Each rewrite is validated and reverted on failure so it never destabilises the client. No Telegram bytes are patched.
+
+| Patch | Type | What it does |
+| --- | --- | --- |
+| Spoof profile gifts | `dll` | Rewrites the star gifts shown on a profile, locally, by rewriting the `payments.savedStarGifts` response inside the runtime library. It has its own Settings window where you set the spoofed sender (user/channel/chat, Bot-API-style id), date, gift id, Stars price, convert-to-Stars value, caption, supply (available/total) and badges (Limited, Can upgrade with a price, Auction with title + gift number, Was refunded). It can also swap the gift's sticker to a custom emoji: enter the custom-emoji id or press **Get id from gift** (looks it up from `api.changes.tg`), then open that emoji's pack once so the full document is captured and substituted (use an animated TGS/WEBM emoji so it renders inside the gift, not only in the list). "Save & Apply" updates a running Telegram live — re-open the profile to refresh. No Telegram bytes are patched. |
+| Spoof profile unique gifts | `dll` | Makes a profile's gift show as an upgraded (unique) gift, locally, by rewriting the `payments.savedStarGifts` response inside the runtime library. Its own Settings window: pick an upgradable gift (catalog from `api.changes.tg`) or **Empty** for fully-custom ids, then set title, unique number, model, symbol, backdrop, issued/total counts, value and last-resale, and identity (sender, owner, host, owner address, date). Works on already-unique gifts and converts regular gifts to unique. For a converted gift it also answers the gift's value-details request locally so it shows instead of failing. "Save & Apply" updates a running Telegram live — re-open the profile to refresh; whose-profile targeting (only me / everyone / everyone except me). No Telegram bytes are patched. |
+| Fake transfer | `dll` | Makes a spoofed gift transferable and fakes the transfer, locally. Adds a **Transfer** button to the gift on your profile and in the gift-send window; when you transfer it, a "transferred" service message appears in the recipient's chat. With it on, even a real gift is never actually transferred — the request is invalidated, so nothing reaches the server and the recipient gets nothing; the message is local-only and disappears on restart. Requires **Spoof profile unique gifts**. No Telegram bytes are patched. |
+| Show hidden gifts | `dll` | Adds extra star gifts to the gift purchase menu, locally, by appending entries to the `payments.starGifts` response inside the runtime library. The injected gifts (price 50 Stars, not limited) appear at the **top** of the list; their stickers use the matching custom emoji resolved from `api.changes.tg`. No Telegram bytes are patched. |
+
+### Misc
+
+| Patch | Type | What it does |
+| --- | --- | --- |
+| DLL injection | `dll` | Injects Patchgram's runtime library (`Patchgram.dll`) into Telegram Desktop through a launcher. The real `Telegram.exe` is renamed to `Telegram_real.exe` and a small launcher takes its place; on every launch the launcher starts the real client suspended, injects `Patchgram.dll`, then resumes it — so every launch is patched. This is the base hook every runtime patch loads through; on its own it loads the library with no behavior change. |
+| MTProto request/response logger | `dll` | Logs every MTProto request Telegram sends and every response it receives — each with a timestamp — to `PatchgramHook.log` next to `Telegram.exe`. The logger opens its file in the injected library's constructor, before Telegram sends its first packet, so the trace is complete from launch. Each line is the **fully decoded TL** — method/type plus its recursively-decoded fields (flags, vectors, nested objects, strings) — via a built-in TL decoder, so logs are readable with no external tools. Enabling it auto-enables DLL injection. Drawn by `Patchgram.dll` — no Telegram bytes are patched. |
+
+## Message Settings Subpatches
+
+| Subpatch | What it does |
+| --- | --- |
+| Typing activity | Stops typing indicators from being sent. |
+| Read receipts | Stops read-history requests from being sent through the patched paths. |
+| Local drafts | Keeps drafts local by blocking draft sync requests. |
+| Custom Fact Check | Locally triggers Telegram Desktop's Fact Check request path for visible posts and replaces `messages.getFactCheck` responses with your own Fact Check text. |
+| Copy/save protect content | Forces `message#7600b9d3` `noforwards` (flags.26) to false on each message locally, so you can copy text and save media from chats/channels that restrict saving. (Forwarding can still be blocked by the separate channel-level restriction.) |
+| Disable TTL | Disables self-destruct/auto-delete timers locally: forces media `ttl_seconds` (view-once video/document) to 0 at construction, and zeroes the message `ttl_period` auto-delete time so timed messages are not removed locally. |
+
+## Disable Premium, Stars, TON & Gifts Subpatches
+
+| Subpatch | What it does |
+| --- | --- |
+| App config | Blocks the monetization app config request. |
+| Premium UI | Hides or disables Premium UI entry points locally. |
+| Gifts | Hides or blocks gift-related UI/actions locally. |
+| Paid reactions | Blocks paid reaction availability/sending/decoding paths locally. |
+| Emoji statuses and effects | Hides or blocks emoji status and related premium effects locally. |
+| Stars, TON and collectibles | Hides or blocks Stars, TON, and collectible monetization surfaces locally. |
+| Boosts | Hides or disables boost-related menu/actions locally. |
+| Read receipts fix | Keeps the local who-read menu behavior compatible with the monetization patch. |
+
+## Custom Account Settings Subpatches
+
+| Subpatch | What it does |
+| --- | --- |
+| Custom Stars | Visually changes your Stars balance in My Stars and monetization-related places. |
+| Custom TON | Visually changes your TON balance in My TON and monetization-related places. |
+| Custom level rating | Visually changes Stars level/rating values for selected users. |
+| Visual peer badge | Visually adds a local Verified, Scam, or Fake badge to selected users/channels. |
+| Bot verification | Visually adds local bot verification details. You can choose where it appears and which preset to use. |
+| Local Telegram Premium | Makes Telegram Desktop treat Premium as locally available for UI gates. |
+| Account freeze | Makes Telegram Desktop show the account as frozen by injecting freeze dates and an appeal URL into the local `help.appConfig` response. |
+| Custom phone number | Visually replaces your own phone number locally. Empty value means original phone. |
+| Custom userID | Visually replaces your own displayed user ID locally. Empty value means original ID. |
+| Local attached channel | Visually attaches another channel by channel ID. For it to display correctly in your own client, open/load that channel in Telegram Desktop first. |
+| Fragment phone | Makes the displayed phone look collectible locally and lets you set local `fragment.collectibleInfo` values. |
+| Custom list usernames | Replaces the username list shown in your self-profile locally. Usernames can be regular or collectible, and collectible usernames can return custom `fragment.collectibleInfo` values. |
+
+## Disable Ads Subpatches
+
+| Subpatch | What it does |
+| --- | --- |
+| Telegram Ads | Blocks sponsored message request paths. |
+| Proxy sponsor | Blocks proxy sponsor promotion request/UI paths. |

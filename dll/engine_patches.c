@@ -187,6 +187,7 @@ static int     g_gift_spoof_was_refunded   = 0;
 static int     g_gift_spoof_upgrade        = 0;   // set savedStarGift.can_upgrade (shows Upgrade button)
 static char    g_gift_spoof_caption[1024]  = {0}; // savedStarGift.message text (inject TWE)
 static int     g_gift_spoof_auction        = 0;   // set starGift.auction + insert the auction trio
+static char    g_gift_spoof_auction_title[256] = {0}; // starGift.title (f0.5) — shown on auction/upgraded gifts
 // Spoof profile UNIQUE gifts: rebuild the first regular starGift in a savedStarGifts response as an upgraded
 // starGiftUnique with these attributes (engine: pg_gift_unique_rebuild).
 static bool    g_gift_unique_enabled       = false;
@@ -392,6 +393,7 @@ int pg_config_load(const char *json) {
     g_gift_spoof_was_refunded       = json_bool(json, "giftSpoofWasRefunded", false) ? 1 : 0;
     g_gift_spoof_upgrade            = json_bool(json, "giftSpoofUpgrade", false) ? 1 : 0;
     g_gift_spoof_auction            = json_bool(json, "giftSpoofAuction", false) ? 1 : 0;
+    json_string(json, "giftSpoofAuctionTitle", g_gift_spoof_auction_title, sizeof g_gift_spoof_auction_title);
     json_string(json, "giftSpoofCaption", g_gift_spoof_caption, sizeof g_gift_spoof_caption);
     g_gift_spoof_target_mode        = pg_parse_target_mode(json, "giftSpoofTargetMode");
     if (g_gift_spoof_target_mode == 0) memset(g_gift_spoof_req_ring, 0, sizeof g_gift_spoof_req_ring);
@@ -874,10 +876,11 @@ static int pg_gift_insert_field(const void *cont, size_t insert_off, const uint8
     if (!words || wc <= 0) return 0;
     uint8_t *body = (uint8_t *)words; const size_t old_len = (size_t)wc * 4;
     if (insert_off > old_len || flag_off + 4 > old_len) return 0;
+    uint32_t orig_flags; memcpy(&orig_flags, body + flag_off, 4);
+    if (orig_flags & flag_bit) return 0;                        // field already present → nothing to insert
     const size_t changed = old_len - insert_off;
     static uint8_t stage[131072];
     if (changed > sizeof stage) return 0;
-    uint32_t orig_flags; memcpy(&orig_flags, body + flag_off, 4);
     memcpy(stage, body + insert_off, changed);                 // stage the tail that will shift
     const int32_t new_wc = wc + (int32_t)(add_len / 4);
     if (new_wc > pg_qvec_capacity(cont)) {
@@ -895,78 +898,76 @@ static int pg_gift_insert_field(const void *cont, size_t insert_off, const uint8
     pg_qvec_set_size(cont, new_wc);
     return 1;
 }
-// Caption (savedStarGift.message TWE f0.2) + auction (starGift trio f0.11) on the first regular gift. Each is a
-// validated splice; caption goes after the gift (message position), auction inside the starGift (auction_slug).
-// Caption + auction + transfer-button: length-changing savedStarGift/starGift field inserts on the first
-// regular gift (must run BEFORE pg_gift_unique_rebuild converts the gift to unique). Each is an independent
-// validated splice + revert. Self-gates on the savedStarGifts ctor + an unshared buffer.
+// Length-changing field inserts on EVERY regular gift in a savedStarGifts response (not just the first):
+// gift_num (f0.19), transfer_stars (f0.8), caption/message (f0.2), auction trio (f0.11), title (f0.5) and
+// availability_remains+total (f0.0). For each gift we walk once (find_gift_n) then insert the missing fields
+// in strictly HIGH→LOW byte order so every captured offset stays valid as the buffer grows; pg_gift_insert_field
+// validates + reverts per field and skips fields already present. Must run BEFORE pg_gift_unique_rebuild.
+// Self-gates on the savedStarGifts ctor + an unshared buffer.
 static void pg_gift_extras(void *resp) {
-    int want_cap = g_gift_spoof_enabled && g_gift_spoof_caption[0] != 0;
-    int want_auc = g_gift_spoof_enabled && g_gift_spoof_auction != 0;
-    int want_xfer = g_fake_transfer_enabled != 0;
-    if (!want_cap && !want_auc && !want_xfer) return;
+    int want_cap   = g_gift_spoof_enabled && g_gift_spoof_caption[0] != 0;
+    int want_auc   = g_gift_spoof_enabled && g_gift_spoof_auction != 0;
+    int want_lim   = g_gift_spoof_enabled && g_gift_spoof_force_limited != 0;
+    int want_title = g_gift_spoof_enabled && g_gift_spoof_auction_title[0] != 0;
+    int want_num   = g_gift_spoof_enabled && g_gift_spoof_gift_num != 0;
+    int want_xfer  = g_fake_transfer_enabled != 0;
+    if (!want_cap && !want_auc && !want_lim && !want_title && !want_num && !want_xfer) return;
     const void *cont = (const uint8_t *)resp + PG_RESPONSE_REPLY_OFFSET;
     { int32_t wc0 = 0; uint32_t *w0 = pg_qvec_data(cont, &wc0);
       if (!w0 || wc0 < 4 || w0[0] != 0x95f389b1u) return;          // payments.savedStarGifts only
       if (!pg_qvec_unshared(cont)) return; }
     static uint32_t logs = 0;
-    // Transfer button first (highest offset: transfer_stars is savedStarGift param 16, after message[10]).
-    // Insert transfer_stars=0 (free transfer) + flip f0.8 → Telegram shows the Transfer button on the gift.
-    if (want_xfer) {
-        int32_t wc = 0; uint32_t *words = pg_qvec_data(cont, &wc);
-        if (words && wc > 0) {
-            size_t goff, glen, foff, aoff, xoff;
-            if (patchgram_tl_find_gift_splice((const uint8_t *)words, (size_t)wc * 4, &goff, &glen, &foff, &aoff, &xoff) && xoff) {
-                uint32_t fl; memcpy(&fl, (const uint8_t *)words + foff, 4);
-                if (!((fl >> 8) & 1u)) {                       // only ADD when transfer_stars absent
-                    uint8_t ts[8]; int64_t zero = 0; memcpy(ts, &zero, 8);
-                    int ok = pg_gift_insert_field(cont, xoff, ts, 8, foff, (1u << 8));
-                    if (logs < 16) { logs++; pg_logf("GIFT TRANSFER-STARS %s (off=%zu)", ok ? "inserted" : "skip", xoff); }
-                }
-            }
+    int gifts = 0, inserts = 0;
+    for (int gi = 0; gi < 128; gi++) {
+        struct PgGiftSplice s;
+        { int32_t wc = 0; uint32_t *words = pg_qvec_data(cont, &wc);
+          if (!words || wc <= 0) break;
+          if (!patchgram_tl_find_gift_n((const uint8_t *)words, (size_t)wc * 4, gi, &s) || !s.found) break; }
+        gifts++;
+        // 1) savedStarGift.gift_num (f0.19) — the gift number (e.g. "#1337"), shown on auction/upgraded gifts.
+        if (want_num && s.gift_num_off) {
+            uint8_t v4[4]; int32_t n = g_gift_spoof_gift_num; memcpy(v4, &n, 4);
+            inserts += pg_gift_insert_field(cont, s.gift_num_off, v4, 4, s.sg_flags_off, (1u << 19));
+        }
+        // 2) savedStarGift.transfer_stars=0 (f0.8) → Transfer button.
+        if (want_xfer && s.transfer_off) {
+            uint8_t v8[8]; int64_t z = 0; memcpy(v8, &z, 8);
+            inserts += pg_gift_insert_field(cont, s.transfer_off, v8, 8, s.sg_flags_off, (1u << 8));
+        }
+        // 3) savedStarGift.message (f0.2) TWE caption, inserted right after the gift.
+        if (want_cap) {
+            static uint8_t twe[1280]; size_t ap = 0;
+            ap = pg_put_u32(twe, ap, PG_TL_TEXT_WITH_ENTITIES);
+            ap = pg_tl_put_string(twe, ap, g_gift_spoof_caption);
+            ap = pg_put_u32(twe, ap, PG_TL_VECTOR_ID); ap = pg_put_u32(twe, ap, 0);   // empty entities
+            if (!(ap & 3u) && ap <= sizeof twe)
+                inserts += pg_gift_insert_field(cont, s.gift_off + s.gift_len, twe, ap, s.sg_flags_off, (1u << 2));
+        }
+        // 4) starGift.auction trio (f0.11): auction_slug + gifts_per_round + auction_start_date.
+        if (want_auc && s.auction_off) {
+            static uint8_t trio[256]; size_t ap = 0;
+            ap = pg_tl_put_string(trio, ap, "auction");
+            ap = pg_put_u32(trio, ap, 1);
+            ap = pg_put_u32(trio, ap, (uint32_t)(g_gift_spoof_date ? g_gift_spoof_date : 1700000000));
+            if (!(ap & 3u) && ap <= sizeof trio)
+                inserts += pg_gift_insert_field(cont, s.auction_off, trio, ap, s.gift_off + 4, (1u << 11));
+        }
+        // 5) starGift.title (f0.5) — the gift name shown on auction/upgraded gifts.
+        if (want_title && s.title_off) {
+            static uint8_t tb[320]; size_t ap = 0;
+            ap = pg_tl_put_string(tb, ap, g_gift_spoof_auction_title);
+            if (!(ap & 3u) && ap <= sizeof tb)
+                inserts += pg_gift_insert_field(cont, s.title_off, tb, ap, s.gift_off + 4, (1u << 5));
+        }
+        // 6) starGift.availability_remains+availability_total (f0.0) → "N of M available".
+        if (want_lim && s.avail_off) {
+            uint8_t pair[8]; int32_t rem = g_gift_spoof_available, tot = g_gift_spoof_total;
+            memcpy(pair, &rem, 4); memcpy(pair + 4, &tot, 4);
+            inserts += pg_gift_insert_field(cont, s.avail_off, pair, 8, s.gift_off + 4, 1u);
         }
     }
-    // Caption next (insert after the gift = message position; higher offset than auction).
-    if (want_cap) {
-        int32_t wc = 0; uint32_t *words = pg_qvec_data(cont, &wc);
-        if (words && wc > 0) {
-            size_t goff, glen, foff, aoff, xoff;
-            if (patchgram_tl_find_gift_splice((const uint8_t *)words, (size_t)wc * 4, &goff, &glen, &foff, &aoff, &xoff)) {
-                uint32_t fl; memcpy(&fl, (const uint8_t *)words + foff, 4);
-                if (!((fl >> 2) & 1u)) {                       // only ADD when message is absent
-                    static uint8_t twe[1280]; size_t ap = 0;
-                    ap = pg_put_u32(twe, ap, PG_TL_TEXT_WITH_ENTITIES);
-                    ap = pg_tl_put_string(twe, ap, g_gift_spoof_caption);
-                    ap = pg_put_u32(twe, ap, PG_TL_VECTOR_ID); ap = pg_put_u32(twe, ap, 0);   // empty entities
-                    if (!(ap & 3u) && ap <= sizeof twe) {
-                        int ok = pg_gift_insert_field(cont, goff + glen, twe, ap, foff, (1u << 2));
-                        if (logs < 16) { logs++; pg_logf("GIFT CAPTION %s (off=%zu len=%zu)", ok ? "inserted" : "skip", goff + glen, ap); }
-                    }
-                }
-            }
-        }
-    }
-    // Auction trio: auction_slug(string) + gifts_per_round(int) + auction_start_date(int) at the auction_slug
-    // boundary; flips starGift.auction (f0.11) at the starGift flags = gift_off+4.
-    if (want_auc) {
-        int32_t wc = 0; uint32_t *words = pg_qvec_data(cont, &wc);
-        if (words && wc > 0) {
-            size_t goff, glen, foff, aoff, xoff;
-            if (patchgram_tl_find_gift_splice((const uint8_t *)words, (size_t)wc * 4, &goff, &glen, &foff, &aoff, &xoff) && aoff) {
-                uint32_t sfl; memcpy(&sfl, (const uint8_t *)words + goff + 4, 4);
-                if (!((sfl >> 11) & 1u)) {                     // only ADD when auction is absent
-                    static uint8_t trio[256]; size_t ap = 0;
-                    ap = pg_tl_put_string(trio, ap, "auction");
-                    ap = pg_put_u32(trio, ap, 1);                                  // gifts_per_round
-                    ap = pg_put_u32(trio, ap, (uint32_t)(g_gift_spoof_date ? g_gift_spoof_date : 1700000000));
-                    if (!(ap & 3u) && ap <= sizeof trio) {
-                        int ok = pg_gift_insert_field(cont, aoff, trio, ap, goff + 4, (1u << 11));
-                        if (logs < 16) { logs++; pg_logf("GIFT AUCTION %s (off=%zu len=%zu)", ok ? "inserted" : "skip", aoff, ap); }
-                    }
-                }
-            }
-        }
-    }
+    if (logs < 24) { logs++; pg_logf("GIFT EXTRAS: %d gifts, %d inserts (cap=%d auc=%d lim=%d title=%d num=%d xfer=%d)",
+                                     gifts, inserts, want_cap, want_auc, want_lim, want_title, want_num, want_xfer); }
 }
 
 // ---- gift spoof: rewrite the scalar fields of every gift in a payments.savedStarGifts response ----

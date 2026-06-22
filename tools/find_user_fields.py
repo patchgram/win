@@ -6,7 +6,7 @@ import sys, struct, bisect, os
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_OP_MEM, CS_OP_REG, CS_OP_IMM
 
-EXE = r"E:\patchgram\patchgramtest\Telegram.exe"
+EXE = os.environ.get("PATCHGRAM_EXE") or os.path.join(os.path.dirname(__file__), "..", "Telegram", "Telegram.exe")
 pe = pefile.PE(EXE, fast_load=True)
 base = pe.OPTIONAL_HEADER.ImageBase
 data = pe.__data__

@@ -1,6 +1,6 @@
-import re, codecs, sys
+import re, codecs, sys, os
 
-path = r"E:\patchgram\win\dll\tl_schema.c.inc"
+path = os.environ.get("PATCHGRAM_TL_SCHEMA") or os.path.join(os.path.dirname(__file__), "..", "dll", "tl_schema.c.inc")
 lines = open(path, "r", encoding="utf-8", errors="replace").read().splitlines()
 
 # Reconstruct g_tl_strpool bytes from its C string-literal lines.

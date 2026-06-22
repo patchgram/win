@@ -1,0 +1,126 @@
+name: Build & Release (Windows)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Vendor MinHook
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dll/minhook")) {
+            git clone --depth 1 https://github.com/TsudaKageyu/minhook dll/minhook
+          } else {
+            Write-Host "dll/minhook already present, skipping clone."
+          }
+
+      - name: Build Patchgram.dll
+        shell: cmd
+        run: |
+          call dll\build.bat || exit /b 1
+          if not exist "dll\Patchgram.dll" ( echo ERROR: dll\Patchgram.dll not found & exit /b 1 )
+
+      - name: Build pg_launcher.exe
+        shell: cmd
+        run: |
+          call launcher\build.bat || exit /b 1
+          if not exist "launcher\pg_launcher.exe" ( echo ERROR: launcher\pg_launcher.exe not found & exit /b 1 )
+
+      - name: Stage assets for Flutter bundle
+        shell: pwsh
+        run: |
+          Copy-Item -Path "dll/Patchgram.dll"        -Destination "gui_flutter/assets/Patchgram.dll"  -Force
+          Copy-Item -Path "launcher/pg_launcher.exe" -Destination "gui_flutter/assets/pg_launcher.exe" -Force
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Flutter pub get
+        working-directory: gui_flutter
+        run: flutter pub get
+
+      - name: Flutter build windows (release)
+        working-directory: gui_flutter
+        run: flutter build windows --release
+
+      - name: Assemble release folder & zip
+        shell: pwsh
+        run: |
+          $src = "gui_flutter/build/windows/x64/runner/Release"
+          $dst = "Patchgram"
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          Copy-Item -Path $src -Destination $dst -Recurse
+          Rename-Item -Path (Join-Path $dst "patchgram_gui.exe") -NewName "Patchgram.exe"
+          $zip = "Patchgram-${{ github.ref_name }}.zip"
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Compress-Archive -Path "$dst/*" -DestinationPath $zip -CompressionLevel Optimal
+          Write-Host "Created $zip"
+
+      - name: Extract changelog section for tag
+        id: changelog
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"          # e.g. v1.0.0
+          $ver = $tag -replace '^v', ''            # e.g. 1.0.0
+          $bodyFile = "RELEASE_BODY.md"
+          $found = $false
+
+          if (Test-Path "CHANGELOG.md") {
+            $lines = Get-Content "CHANGELOG.md"
+            # A heading matches if it is "## <tag>", "## <ver>", "## [<tag>]" or "## [<ver>]"
+            # optionally followed by extra text (e.g. a date).
+            $headingRe = '^\s{0,3}##\s+\[?(v?' + [regex]::Escape($ver) + ')\]?(\s|$)'
+            $section = New-Object System.Collections.Generic.List[string]
+            $capturing = $false
+            foreach ($line in $lines) {
+              if ($capturing) {
+                # Stop at the next top-level "## " heading.
+                if ($line -match '^\s{0,3}##\s+') { break }
+                $section.Add($line)
+              } elseif ($line -match $headingRe) {
+                $capturing = $true
+                $found = $true
+              }
+            }
+            if ($found) {
+              # Trim leading/trailing blank lines.
+              $text = ($section -join "`n").Trim()
+              if ([string]::IsNullOrWhiteSpace($text)) {
+                $found = $false
+              } else {
+                Set-Content -Path $bodyFile -Value $text -Encoding utf8
+                Write-Host "Using CHANGELOG.md section for $tag."
+              }
+            }
+          }
+
+          if ($found) {
+            "body_path=$bodyFile"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "generate_notes=false"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            Write-Host "No matching CHANGELOG.md section for $tag; falling back to auto-generated notes."
+            "body_path="                   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            "generate_notes=true"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Patchgram ${{ github.ref_name }}
+          body_path: ${{ steps.changelog.outputs.body_path }}
+          generate_release_notes: ${{ steps.changelog.outputs.generate_notes }}
+          files: Patchgram-${{ github.ref_name }}.zip

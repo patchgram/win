@@ -1,6 +1,6 @@
-import re, sys
+import re, sys, os
 
-path = r"E:\patchgram\win\dll\tl_schema.c.inc"
+path = os.environ.get("PATCHGRAM_TL_SCHEMA") or os.path.join(os.path.dirname(__file__), "..", "dll", "tl_schema.c.inc")
 data = open(path, encoding="utf-8", errors="replace").read()
 
 m = re.search(r'g_tl_strpool\[\]\s*=\s*(.*?);', data, re.S)

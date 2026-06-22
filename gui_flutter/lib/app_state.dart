@@ -10,6 +10,7 @@ class AppState extends ChangeNotifier {
   String telegramPath = '';
   String dllPath = '';
   String launcherPath = '';   // bundled pg_launcher.exe — installed AS Telegram.exe for persistent patching
+  bool archUnsupported = false;   // selected Telegram.exe is not 64-bit (x64) → patching blocked + warned
   String status = 'Pick Telegram.exe, toggle patches, then Apply.';
   double progress = 0;       // top bar fill 0..1 (driven during Apply / Disable All)
   bool applying = false;     // an Apply/Disable operation is in flight (isWorking)
@@ -99,9 +100,33 @@ class AppState extends ChangeNotifier {
 
   /// Read ProductName + ProductVersion from Telegram.exe's version info and extract its icon to a PNG
   /// (shown next to "Selected app"). Done via PowerShell so no native FFI is needed.
+  // PE machine type of an .exe from its COFF header: 0x8664 = x64, 0x14c = x86 (32-bit), 0xaa64 = ARM64,
+  // 0 = couldn't read. e_lfanew @0x3C → "PE\0\0" + Machine(2).
+  int _peMachine(String exePath) {
+    try {
+      final raf = File(exePath).openSync();
+      try {
+        final head = raf.readSync(0x40);
+        if (head.length < 0x40) return 0;
+        final e = head[0x3C] | (head[0x3D] << 8) | (head[0x3E] << 16) | (head[0x3F] << 24);
+        raf.setPositionSync(e);
+        final pe = raf.readSync(6);
+        if (pe.length < 6 || pe[0] != 0x50 || pe[1] != 0x45) return 0;   // 'P','E'
+        return pe[4] | (pe[5] << 8);
+      } finally { raf.closeSync(); }
+    } catch (_) { return 0; }
+  }
+
   Future<void> _readAppInfo() async {
     final exe = realExePath;   // the real client (post-install it's Telegram_real.exe), not our launcher
     if (exe.isEmpty || !File(exe).existsSync()) return;
+    // Architecture gate: Patchgram's DLL is x64, so a 32-bit (or other-arch) Telegram can't be patched.
+    final m = _peMachine(exe);
+    archUnsupported = m != 0 && m != 0x8664;   // unknown (0) → don't block; only block a confirmed non-x64 build
+    if (archUnsupported) {
+      status = 'This Telegram is 32-bit (x86) — not supported. Install the 64-bit (x64) Telegram Desktop.';
+      notifyListeners();
+    }
     final png = '${File(exe).parent.path}\\.patchgram_telegram_icon.png';
     final pEsc = exe.replaceAll("'", "''");
     final pngEsc = png.replaceAll("'", "''");
@@ -188,10 +213,12 @@ class AppState extends ChangeNotifier {
     }
     return false;
   }
-  // Apply is enabled when there are pending changes OR persistence isn't installed yet but patches are on
-  // (so a first Apply can install the persistent launcher even when the saved config already matches).
-  bool get canApply => telegramPath.isNotEmpty && !applying
-      && (dirty || (!persistenceInstalled && hasEnabledPatch));
+  // Apply is enabled when there are pending changes, persistence isn't installed yet but patches are on
+  // (so a first Apply installs the launcher even if the saved config already matches), OR the patcher itself
+  // was updated since the last Apply (the bundled DLL differs from the installed one) — so a fresh patcher
+  // build can always be re-Applied to deploy its newer DLL even when nothing else changed.
+  bool get canApply => telegramPath.isNotEmpty && !applying && !archUnsupported
+      && (dirty || (!persistenceInstalled && hasEnabledPatch) || _installedDllStale());
   bool get canDisableAll => !applying && hasEnabledPatch;
 
   bool isEnabled(Patch p) => p.keys.isNotEmpty && p.keys.every(boolKey);
@@ -326,6 +353,10 @@ class AppState extends ChangeNotifier {
   Future<void> _runApply(String doneMsg) async {
     if (applying) return;
     if (telegramPath.isEmpty) { status = 'Set Telegram.exe first.'; notifyListeners(); return; }
+    if (archUnsupported) {
+      status = 'This Telegram is 32-bit (x86) — Patchgram supports 64-bit (x64) only. Install the x64 Telegram Desktop.';
+      notifyListeners(); return;
+    }
     applying = true;
     Future<void> step(double p, String m) async { progress = p; status = m; notifyListeners(); await Future.delayed(const Duration(milliseconds: 200)); }
     await step(0.08, 'Applying patches…');
@@ -334,9 +365,12 @@ class AppState extends ChangeNotifier {
     bool installOk = persistenceInstalled;
     if (launcherPath.isNotEmpty && dllPath.isNotEmpty && File(telegramPath).existsSync()) {
       final running = await _telegramRunning();
-      final patched = running && persistenceInstalled && await _dllInjected();
+      // Live-reload only when already patched AND the installed DLL matches the one we bundle. If the bundled
+      // DLL is newer (the patcher was updated), we must redeploy + restart — a running client has the OLD DLL
+      // loaded in memory, so a config-only live-reload would keep using the stale code.
+      final patched = running && persistenceInstalled && await _dllInjected() && !_installedDllStale();
       if (patched) {
-        // Already patched + persistent: the DLL's config watcher reloads the JSON live (~1s). Nothing to launch.
+        // Already patched + persistent + DLL current: the DLL's config watcher reloads the JSON live (~1s).
         await step(0.72, 'Reloading patches live…');
       } else {
         if (running) {
@@ -365,6 +399,21 @@ class AppState extends ChangeNotifier {
     for (final n in const ['Telegram.exe', 'Telegram_real.exe']) {
       try { await Process.run('taskkill', ['/F', '/IM', n]); } catch (_) {}
     }
+  }
+
+  // True if the Patchgram.dll installed beside Telegram differs from the one we bundle (i.e. the patcher was
+  // updated since the last Apply). Cheap (size + mtime only — no byte read) because it's polled from canApply
+  // on every rebuild. Drives canApply + a redeploy+restart so a newer DLL actually reaches the client.
+  bool _installedDllStale() {
+    try {
+      if (dllPath.isEmpty || telegramDir.isEmpty) return false;
+      final bundled = File(dllPath);
+      if (!bundled.existsSync()) return false;
+      final installed = File('$telegramDir\\Patchgram.dll');
+      if (!installed.existsSync()) return true;
+      if (bundled.lengthSync() != installed.lengthSync()) return true;
+      return bundled.lastModifiedSync().isAfter(installed.lastModifiedSync());
+    } catch (_) { return false; }
   }
 
   // Install persistence so launching Telegram.exe ANY way (shortcut, double-click, tg:// link) is patched —

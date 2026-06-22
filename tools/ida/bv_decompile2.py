@@ -1,7 +1,8 @@
-import time, sys
+import time, sys, os
 t0=time.time()
 import idapro
-rc=idapro.open_database(r"E:\patchgram\patchgramtest\Telegram.exe", run_auto_analysis=False)
+EXE = os.environ.get("PATCHGRAM_EXE") or os.path.join(os.path.dirname(__file__), "..", "..", "Telegram", "Telegram.exe")
+rc=idapro.open_database(EXE, run_auto_analysis=False)
 print("open rc:", rc, "in %.1fs"%(time.time()-t0), flush=True)
 import ida_hexrays, ida_funcs, ida_auto, ida_bytes, idc
 ida_hexrays.init_hexrays_plugin()
