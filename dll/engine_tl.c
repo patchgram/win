@@ -121,6 +121,10 @@ static void patchgram_tl_str(struct PatchgramTLReader *r, struct PatchgramTLOut 
 #define PG_TL_PEER_CHANNEL              0xa2a5371eu
 #define PG_TL_PEER_CHAT                 0x36c6019au
 #define PG_TL_DOCUMENT                  0x8fd4c4d8u
+#define PG_TL_DOC_ATTR_STICKER          0x6319d612u   // documentAttributeSticker
+#define PG_TL_DOC_ATTR_CUSTOM_EMOJI     0xfd149899u   // documentAttributeCustomEmoji
+#define PG_TL_MESSAGES_STICKER_SET      0x6e153f16u   // messages.stickerSet
+#define PG_TL_STAR_GIFT_UPGRADE_PREVIEW 0x3de1dfedu   // payments.starGiftUpgradePreview
 
 // Overwrite one fixed-size scalar field of a gift in place (base subset; ported from
 // patchgram_gift_rewrite_field, sans the unique-gift branches). `r->pos` is the field's byte offset.
@@ -216,8 +220,18 @@ static void patchgram_tl_decode_ctor(uint32_t id, struct PatchgramTLReader *r,
     }
     patchgram_tl_put(o, g_tl_strpool + c->name_off);
     if (with_id) { snprintf(scratch, sizeof scratch, "#%08x", id); patchgram_tl_put(o, scratch); }
+    // capture: the documentAttributeSticker ctor word offset + its flags (first param). Used to flip a
+    // captured/cloned sticker doc → documentAttributeCustomEmoji so it renders via the custom-emoji path.
+    if (rw && rw->find_sticker_attr && rw->sticker_attr_off == 0
+        && id == PG_TL_DOC_ATTR_STICKER && r->pos + 4 <= r->len) {
+        rw->sticker_attr_off = rw->last_ctor_start;          // where the ctor u32 sits
+        memcpy(&rw->sticker_attr_flags, r->p + r->pos, 4);   // its flags field (first param)
+    }
     // capture: remember the first Document's start (clone template) — finalized to a length below.
-    if (rw && rw->find_first_doc && rw->found_len == 0 && !rw->doc_match_pending && id == PG_TL_DOCUMENT) {
+    // When find_doc_id is set, instead capture the Document whose id field (matched in the param loop)
+    // equals find_doc_id; only fall back to "first document" when find_doc_id is 0.
+    if (rw && rw->find_first_doc && !rw->find_doc_id && rw->found_len == 0 && !rw->doc_match_pending
+        && id == PG_TL_DOCUMENT) {
         rw->found_off = rw->last_ctor_start; rw->doc_match_pending = 1;
     }
     // capture (unique-gift rebuild): first regular starGift span, then its sticker Document span (the first
@@ -239,6 +253,14 @@ static void patchgram_tl_decode_ctor(uint32_t id, struct PatchgramTLReader *r,
     bool first = true;
     for (uint16_t i = 0; i < c->pcount && !r->err && !o->full; i++) {
         const struct PatchgramTLParam *p = &g_tl_params[c->pstart + i];
+        // Generic Document-by-id finder: when this is a Document's `id` LONG and it matches find_doc_id,
+        // remember the document's start (the boxed ctor offset recorded in decode_value) — finalized on exit
+        // via doc_match_pending (same as find_first_doc). Used to capture a real custom-emoji doc by its id.
+        if (rw && rw->find_doc_id && rw->found_len == 0 && !rw->doc_match_pending && id == PG_TL_DOCUMENT
+            && p->op == PG_TL_LONG && strcmp(g_tl_strpool + p->name_off, "id") == 0 && r->pos + 8 <= r->len) {
+            int64_t did = 0; memcpy(&did, r->p + r->pos, 8);
+            if (did == rw->find_doc_id) { rw->found_off = rw->last_ctor_start; rw->doc_match_pending = 1; }
+        }
         // caption/auction capture: record the wrapping savedStarGift's flags offset (committed when the first
         // regular starGift is found) and the starGift's auction_slug insert boundary (param pos, present or not).
         if (rw && rw->find_saved_gift) {
@@ -259,6 +281,12 @@ static void patchgram_tl_decode_ctor(uint32_t id, struct PatchgramTLReader *r,
             && strcmp(g_tl_strpool + p->name_off, "transfer_stars") == 0) rw->sg_transfer_off = r->pos;
         if (rw && rw->sg_post_gift && rw->sg_gift_num_off == 0 && id == PG_TL_SAVED_STAR_GIFT
             && strcmp(g_tl_strpool + p->name_off, "gift_num") == 0) rw->sg_gift_num_off = r->pos;
+        // can_export_at (f0.7) / can_transfer_at (f0.13): int VALUE offsets (present only when the gift has a
+        // cooldown) — overwriting them with a past timestamp drops the "Try Later — transfer in N days" gate.
+        if (rw && rw->sg_post_gift && rw->sg_can_export_off == 0 && id == PG_TL_SAVED_STAR_GIFT
+            && strcmp(g_tl_strpool + p->name_off, "can_export_at") == 0) rw->sg_can_export_off = r->pos;
+        if (rw && rw->sg_post_gift && rw->sg_can_transfer_off == 0 && id == PG_TL_SAVED_STAR_GIFT
+            && strcmp(g_tl_strpool + p->name_off, "can_transfer_at") == 0) rw->sg_can_transfer_off = r->pos;
         if (p->op == PG_TL_FLAGS) {
             const size_t flags_pos = r->pos;
             uint32_t v = patchgram_tl_u32(r);
@@ -321,7 +349,7 @@ static void patchgram_tl_decode_ctor(uint32_t id, struct PatchgramTLReader *r,
             rw->thumbs_off = before_pos; rw->thumbs_len = r->pos - before_pos;
         }
     }
-    // capture: finalize the first Document's byte length once its ctor is fully parsed.
+    // capture: finalize the matched Document's byte length once its ctor is fully parsed (first-doc or by-id).
     if (rw && rw->doc_match_pending && id == PG_TL_DOCUMENT && !r->err) {
         rw->found_len = r->pos - rw->found_off; rw->doc_match_pending = 0; rw->find_first_doc = 0;
     }
@@ -398,6 +426,28 @@ int patchgram_tl_find_saved_gift(const uint8_t *body, size_t bytelen,
     return 1;
 }
 
+// Same as patchgram_tl_find_saved_gift but for the (gift_index)-th regular starGift (0 = first). Lets the
+// caller rebuild EVERY gift (LAST→FIRST) instead of only the first. Returns 1 iff that gift exists.
+int patchgram_tl_find_saved_gift_n(const uint8_t *body, size_t bytelen, int gift_index,
+                                   size_t *gift_off, size_t *gift_len, size_t *doc_off, size_t *doc_len) {
+    if (gift_off) *gift_off = 0; if (gift_len) *gift_len = 0;
+    if (doc_off)  *doc_off  = 0; if (doc_len)  *doc_len  = 0;
+    if (!body || bytelen < 16 || gift_index < 0) { return 0; }
+    struct PatchgramTLRewrite rw; memset(&rw, 0, sizeof rw);
+    rw.base = (uint8_t *)body;
+    rw.find_saved_gift = 1;
+    rw.sg_gift_target = gift_index;
+    struct PatchgramTLReader r = { body, bytelen, 0, false };
+    struct PatchgramTLOut o = { NULL, 0, 0, false };   // silent sink
+    uint32_t top = patchgram_tl_u32(&r);
+    if (r.err || top != PG_TL_PAYMENTS_SAVED_STAR_GIFTS) { return 0; }
+    patchgram_tl_decode_ctor(top, &r, &o, 0, false, &rw);
+    if (rw.sg_gift_len == 0) { return 0; }
+    if (gift_off) *gift_off = rw.sg_gift_off; if (gift_len) *gift_len = rw.sg_gift_len;
+    if (doc_off)  *doc_off  = rw.sg_doc_off;  if (doc_len)  *doc_len  = rw.sg_doc_len;
+    return 1;
+}
+
 // Find the (gift_index)-th regular starGift + all its splice points (see PgGiftSplice). One read-only walk.
 int patchgram_tl_find_gift_n(const uint8_t *body, size_t bytelen, int gift_index, struct PgGiftSplice *out) {
     if (out) memset(out, 0, sizeof *out);
@@ -417,6 +467,7 @@ int patchgram_tl_find_gift_n(const uint8_t *body, size_t bytelen, int gift_index
     out->sg_flags_off = rw.sg_flags_off;
     out->avail_off = rw.sg_avail_off; out->title_off = rw.sg_title_off; out->auction_off = rw.sg_auction_off;
     out->transfer_off = rw.sg_transfer_off; out->gift_num_off = rw.sg_gift_num_off;
+    out->can_export_off = rw.sg_can_export_off; out->can_transfer_off = rw.sg_can_transfer_off;
     return 1;
 }
 
@@ -461,4 +512,49 @@ int patchgram_tl_find_doc_template(const uint8_t *body, size_t len,
     if (doc_off) *doc_off = rw.found_off; if (doc_len) *doc_len = rw.found_len;
     if (gifts_end) *gifts_end = rw.gifts_end_off;
     return (rw.found_len > 0 && rw.gifts_end_off >= 16) ? 1 : 0;
+}
+
+// Read-only walk of a single Document → the offset of its documentAttributeSticker ctor word + its flags.
+int patchgram_tl_find_sticker_attr(const uint8_t *doc, size_t len, size_t *attr_off, uint32_t *attr_flags) {
+    if (attr_off) *attr_off = 0; if (attr_flags) *attr_flags = 0;
+    if (!doc || len < 4) return 0;
+    struct PatchgramTLRewrite rw; memset(&rw, 0, sizeof rw);
+    rw.base = (uint8_t *)doc; rw.find_sticker_attr = 1;
+    struct PatchgramTLReader r = { doc, len, 0, false };
+    struct PatchgramTLOut o = { NULL, 0, 0, false };
+    uint32_t top = patchgram_tl_u32(&r);
+    if (r.err) return 0;
+    patchgram_tl_decode_ctor(top, &r, &o, 0, false, &rw);
+    if (attr_off) *attr_off = rw.sticker_attr_off; if (attr_flags) *attr_flags = rw.sticker_attr_flags;
+    return (rw.sticker_attr_off > 0) ? 1 : 0;
+}
+
+// Find the byte span of the Document#8fd4c4d8 whose id (doc+8) == doc_id, anywhere in `body` (a
+// getCustomEmojiDocuments / messages.stickerSet / starGiftUpgradePreview reply). Uses a SAFE flat word
+// scan for the ctor+id (not a recursive walk of the whole response, which could blow the stack / mis-walk
+// a large/complex stickerSet), then decodes ONLY that single Document to measure its length (bounded).
+int patchgram_tl_find_doc_by_id(const uint8_t *body, size_t bytelen, int64_t doc_id,
+                                size_t *doc_off, size_t *doc_len) {
+    if (doc_off) *doc_off = 0; if (doc_len) *doc_len = 0;
+    if (!body || bytelen < 20 || !doc_id) return 0;
+    const uint32_t *w = (const uint32_t *)body;
+    const size_t wc = bytelen / 4;
+    for (size_t i = 0; i + 4 <= wc; i++) {                 // document#8fd4c4d8: ctor[i] flags[i+1] id[i+2,i+3]
+        if (w[i] != PG_TL_DOCUMENT) continue;
+        int64_t id; memcpy(&id, body + (i + 2) * 4, 8);
+        if (id != doc_id) continue;
+        const size_t off = i * 4;
+        struct PatchgramTLRewrite rw; memset(&rw, 0, sizeof rw); rw.base = (uint8_t *)(body + off);
+        struct PatchgramTLReader r = { body + off, bytelen - off, 0, false };
+        struct PatchgramTLOut o = { NULL, 0, 0, false };
+        uint32_t top = patchgram_tl_u32(&r);
+        if (r.err || top != PG_TL_DOCUMENT) continue;      // false-positive ctor match → skip
+        patchgram_tl_decode_ctor(top, &r, &o, 0, false, &rw);   // walk ONLY this one Document
+        if (r.err) continue;
+        const size_t dlen = r.pos;                          // bytes consumed = this Document's length
+        if (dlen < 16 || off + dlen > bytelen) continue;
+        if (doc_off) *doc_off = off; if (doc_len) *doc_len = dlen;
+        return 1;
+    }
+    return 0;
 }

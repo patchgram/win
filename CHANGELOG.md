@@ -4,6 +4,19 @@ All notable changes to Patchgram for Windows are documented here. Add a new
 `## v<version>` section per release; the release workflow uses the matching
 section as the GitHub Release body.
 
+## v1.0.1
+
+Gift patch fixes.
+
+- **Fake transfer** now works end to end: rewrites the `STARGIFT_NOT_UNIQUE`
+  payment-form error and clears the transfer cooldown ("Try Later — transfer in
+  N days"), so the spoofed transfer actually goes through.
+- **Spoof profile unique gifts**: the model and symbol (pattern) now render —
+  their emoji are auto-loaded by id at startup, so you no longer have to open the
+  packs by hand.
+- **Auto-load** also covers Spoof profile gifts and Show hidden gifts, so their
+  custom emoji load automatically too.
+
 ## v1.0.0
 
 Initial Windows release — a runtime DLL patcher for Telegram Desktop x64

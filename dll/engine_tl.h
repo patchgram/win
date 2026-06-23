@@ -47,8 +47,13 @@ struct PatchgramTLRewrite {
     int      capture;          // 1 = record the spans below during the walk
     size_t   thumbs_off, thumbs_len;   // a Document's `thumbs` field span (while in_sticker) — for doc_slim
     int      find_first_doc;   // 1 = capture the first Document's byte range (clone template)
+    int64_t  find_doc_id;      // !=0 = capture the Document#8fd4c4d8 whose id (doc+8) == this (else first doc)
     size_t   found_off, found_len;     // that Document's [off, off+len)
     int      doc_match_pending;        // internal: between matching a Document and the end of its ctor
+    // ---- captured custom-emoji doc → sticker-attr flip (unique-gift render; read-only walk) ----
+    int      find_sticker_attr;        // 1 = record the documentAttributeSticker ctor word + its flags
+    size_t   sticker_attr_off;         // byte offset of that ctor u32 (0 = not seen) — flip to customEmoji
+    uint32_t sticker_attr_flags;       // its first param (flags); only flip when this == 0
     size_t   last_ctor_start;          // byte offset of the most recent boxed ctor (set in decode_value)
     int      find_gifts_end;   // 1 = record where payments.starGifts.gifts ends (= start of `chats`)
     size_t   gifts_end_off;
@@ -69,6 +74,8 @@ struct PatchgramTLRewrite {
     int      sg_post_gift;             // walk state: inside the target savedStarGift, AFTER its gift field
     size_t   sg_transfer_off;          // the savedStarGift's transfer_stars insert offset (param boundary, f0.8)
     size_t   sg_gift_num_off;          // the savedStarGift's gift_num insert offset (param boundary, f0.19)
+    size_t   sg_can_export_off;        // savedStarGift.can_export_at VALUE offset (f0.7) — overwrite to bypass cooldown
+    size_t   sg_can_transfer_off;      // savedStarGift.can_transfer_at VALUE offset (f0.13) — overwrite to bypass cooldown
     int      sg_gift_target;           // INPUT: which regular starGift (0-based) to capture (0 = first)
     int      sg_gift_count;            // walk state: regular starGifts seen so far
 };
@@ -83,6 +90,8 @@ struct PgGiftSplice {
     size_t   auction_off;              // starGift auction_slug boundary (f0.11)
     size_t   transfer_off;             // savedStarGift transfer_stars boundary (f0.8)
     size_t   gift_num_off;             // savedStarGift gift_num boundary (f0.19)
+    size_t   can_export_off;           // savedStarGift can_export_at VALUE (f0.7) — overwrite past → bypass cooldown
+    size_t   can_transfer_off;         // savedStarGift can_transfer_at VALUE (f0.13) — overwrite past → bypass cooldown
 };
 
 // Walk a payments.savedStarGifts response IN PLACE, overwriting the configured scalar fields of each
@@ -93,6 +102,10 @@ int patchgram_tl_rewrite_saved_star_gifts(uint8_t *body, size_t bytelen, struct 
 // gift's sticker Document span. Returns 1 iff a regular gift was found (gift_len>0). doc_len may be 0.
 int patchgram_tl_find_saved_gift(const uint8_t *body, size_t bytelen,
                                  size_t *gift_off, size_t *gift_len, size_t *doc_off, size_t *doc_len);
+// Same, but for the (gift_index)-th regular starGift (0-based; 0 = first). Used to rebuild EVERY gift,
+// not just the first. Returns 1 iff that gift exists.
+int patchgram_tl_find_saved_gift_n(const uint8_t *body, size_t bytelen, int gift_index,
+                                   size_t *gift_off, size_t *gift_len, size_t *doc_off, size_t *doc_len);
 // Find the (gift_index)-th regular starGift in a payments.savedStarGifts reply + all its splice points.
 // Returns 1 iff that gift exists (out->found set). gift_index 0 = the first gift (newest = top of the UI).
 int patchgram_tl_find_gift_n(const uint8_t *body, size_t bytelen, int gift_index, struct PgGiftSplice *out);
@@ -102,6 +115,14 @@ int patchgram_tl_find_gift_n(const uint8_t *body, size_t bytelen, int gift_index
 //  - doc_template: in a payments.starGifts buffer, find the first Document (clone template) + the byte
 //    offset where the gifts vector ends (= the `chats` field), used as a structure guard.
 int patchgram_tl_capture_doc_thumbs(const uint8_t *doc, size_t len, size_t *off, size_t *tlen);
+// Read-only walk of a single Document → the byte offset of its documentAttributeSticker ctor word + that
+// attribute's flags (first param). Returns 1 iff found. Caller flips the ctor → documentAttributeCustomEmoji
+// (only when *flags==0) so the cloned/captured sticker renders via the custom-emoji path.
+int patchgram_tl_find_sticker_attr(const uint8_t *doc, size_t len, size_t *attr_off, uint32_t *attr_flags);
+// Read-only walk of a (bare Vector<Document> / messages.stickerSet / starGiftUpgradePreview) response →
+// the byte span of the Document#8fd4c4d8 whose id (doc+8) == doc_id. Returns 1 iff found.
+int patchgram_tl_find_doc_by_id(const uint8_t *body, size_t bytelen, int64_t doc_id,
+                                size_t *doc_off, size_t *doc_len);
 int patchgram_tl_find_doc_template(const uint8_t *body, size_t len,
                                    size_t *doc_off, size_t *doc_len, size_t *gifts_end);
 // Validate that `body` is exactly one well-formed object whose top ctor == `expected_top`.

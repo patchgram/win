@@ -216,6 +216,15 @@ static int64_t g_unique_value_usd          = 0;
 static char    g_unique_value_currency[16] = {0};
 static uint64_t g_unique_model_emoji_id    = 0;   // model attribute document.id (0 = clone gift's own sticker)
 static uint64_t g_unique_symbol_emoji_id   = 0;   // pattern attribute document.id
+// Captured custom-emoji document cache (mirror macOS patchgram_unique_*): a small slot table keyed by the
+// custom-emoji document id, holding a slimmed Document whose documentAttributeSticker was flipped to
+// documentAttributeCustomEmoji. When the chosen model/symbol emoji's real doc has been seen (via a
+// getCustomEmojiDocuments / messages.stickerSet / starGiftUpgradePreview response), the unique-gift rebuild
+// embeds THAT (correct id+access_hash → downloadable → renders the chosen emoji) instead of a swapped-id doc.
+#define PG_UNIQUE_DOC_SLOTS 4
+static int64_t  g_unique_doc_ids[PG_UNIQUE_DOC_SLOTS]   = {0};
+static uint16_t g_unique_doc_len[PG_UNIQUE_DOC_SLOTS]   = {0};
+static uint8_t  g_unique_doc_bytes[PG_UNIQUE_DOC_SLOTS][4096];
 // Last-resale value info: answered separately (payments.getUniqueStarGiftValueInfo → uniqueStarGiftValueInfo).
 static int64_t g_unique_last_resale_amount   = 0;
 static int32_t g_unique_last_resale_date     = 0;
@@ -924,6 +933,25 @@ static void pg_gift_extras(void *resp) {
           if (!words || wc <= 0) break;
           if (!patchgram_tl_find_gift_n((const uint8_t *)words, (size_t)wc * 4, gi, &s) || !s.found) break; }
         gifts++;
+        // 0) Bypass the unique-gift transfer cooldown: overwrite can_export_at (f0.7) / can_transfer_at (f0.13)
+        // with a past timestamp (1 = 1970) so the client drops the "Try Later — transfer in N days" gate and the
+        // Transfer button works immediately. Same-size in-place write (no resize) → done BEFORE the inserts below,
+        // so it doesn't disturb their HIGH→LOW offset bookkeeping. CRITICAL: the walker records each field's param
+        // boundary even when the field is ABSENT (that boundary is the insert point for the other rewriters), so we
+        // must gate each write on the savedStarGift flag bit — writing at an absent field's boundary would clobber
+        // the next field. Only present fields have their value at that offset.
+        if (want_xfer && s.sg_flags_off) {
+            int32_t wc = 0; uint32_t *words = pg_qvec_data(cont, &wc); const size_t blen = (size_t)wc * 4;
+            if (words && s.sg_flags_off + 4 <= blen) {
+                uint32_t fl; memcpy(&fl, (uint8_t *)words + s.sg_flags_off, 4);
+                int32_t past = 1; int did = 0;
+                if ((fl & (1u << 7))  && s.can_export_off   && s.can_export_off   + 4 <= blen) {
+                    memcpy((uint8_t *)words + s.can_export_off,   &past, 4); did = 1; }
+                if ((fl & (1u << 13)) && s.can_transfer_off && s.can_transfer_off + 4 <= blen) {
+                    memcpy((uint8_t *)words + s.can_transfer_off, &past, 4); did = 1; }
+                if (did && logs < 64) { logs++; pg_logf("FAKE TRANSFER cooldown cleared gift=%d flags=%#x", gi, fl); }
+            }
+        }
         // 1) savedStarGift.gift_num (f0.19) — the gift number (e.g. "#1337"), shown on auction/upgraded gifts.
         if (want_num && s.gift_num_off) {
             uint8_t v4[4]; int32_t n = g_gift_spoof_gift_num; memcpy(v4, &n, 4);
@@ -1555,11 +1583,105 @@ static void pg_custom_usernames(void *resp) {
 static uint32_t pg_peer_ctor(int t) {
     return (t == 1) ? PG_TL_PEER_CHANNEL_CTOR : (t == 2) ? PG_TL_PEER_CHAT_CTOR : PG_TL_PEER_USER_CTOR;
 }
+
+// ---- Captured custom-emoji document cache (mirror macOS patchgram_unique_*) ----------------------
+// Top ctors of responses that carry the real custom-emoji Documents we want to capture:
+#define PG_TL_MESSAGES_STICKER_SET      0x6e153f16u   // messages.stickerSet
+#define PG_TL_STAR_GIFT_UPGRADE_PREVIEW 0x3de1dfedu   // payments.starGiftUpgradePreview (sample_attributes)
+#define PG_TL_DOC_ATTR_CUSTOM_EMOJI_CTOR 0xfd149899u  // documentAttributeCustomEmoji (flip target)
+
+// Captured (slimmed + sticker→customEmoji) Document for `emoji_id`, if any. Returns 1 + sets out/len.
+static int pg_unique_captured_doc(int64_t emoji_id, const uint8_t **out, size_t *len) {
+    if (!emoji_id) return 0;
+    for (int i = 0; i < PG_UNIQUE_DOC_SLOTS; i++) {
+        if (g_unique_doc_ids[i] == emoji_id && g_unique_doc_len[i] > 0) {
+            *out = g_unique_doc_bytes[i]; *len = g_unique_doc_len[i]; return 1;
+        }
+    }
+    return 0;
+}
+
+// Slim a captured Document, flip its documentAttributeSticker → documentAttributeCustomEmoji (only when that
+// attribute's flags==0, matching macOS), and store it into a free/matching slot. body+off..+len = the doc.
+static void pg_unique_store_doc(const uint8_t *body, size_t off, size_t len, int64_t emoji_id) {
+    static uint8_t slim[4096];
+    size_t slen = pg_doc_slim(body + off, len, slim, sizeof slim);
+    if (slen == 0 || slen > sizeof g_unique_doc_bytes[0]) return;
+    // Flip the documentAttributeSticker ctor word → documentAttributeCustomEmoji (renders via emoji path).
+    size_t sa_off = 0; uint32_t sa_flags = 0;
+    if (patchgram_tl_find_sticker_attr(slim, slen, &sa_off, &sa_flags)
+        && sa_off > 0 && sa_flags == 0 && sa_off + 4 <= slen) {
+        uint32_t ce = PG_TL_DOC_ATTR_CUSTOM_EMOJI_CTOR; memcpy(slim + sa_off, &ce, 4);
+    }
+    int slot = -1;
+    for (int i = 0; i < PG_UNIQUE_DOC_SLOTS; i++) { if (g_unique_doc_ids[i] == emoji_id) { slot = i; break; } }
+    if (slot < 0) { for (int i = 0; i < PG_UNIQUE_DOC_SLOTS; i++) { if (g_unique_doc_len[i] == 0) { slot = i; break; } } }
+    if (slot < 0) slot = 0;
+    memcpy(g_unique_doc_bytes[slot], slim, slen);
+    g_unique_doc_len[slot] = (uint16_t)slen;
+    g_unique_doc_ids[slot] = emoji_id;
+    // Persisting to disk is intentionally skipped on Windows (cache rebuilds when the emoji packs open).
+    static uint32_t logs = 0;
+    if (logs < 48) { logs++; pg_logf("GIFT UNIQUE captured doc id=%lld len=%zu slot=%d", (long long)emoji_id, slen, slot); }
+}
+
+// Opportunistically capture the chosen model/symbol Documents from a getCustomEmojiDocuments (bare
+// Vector<Document>) / messages.stickerSet / starGiftUpgradePreview response, so the next gift rebuild can
+// embed a renderable doc (correct id + access_hash). Mirror macOS patchgram_unique_capture_response.
+static void pg_unique_capture(void *resp) {
+    if (!resp || !g_gift_unique_enabled) return;
+    int64_t wanted[2] = { (int64_t)g_unique_model_emoji_id, (int64_t)g_unique_symbol_emoji_id };
+    if (!wanted[0] && !wanted[1]) return;
+    const void *cont = (const uint8_t *)resp + PG_RESPONSE_REPLY_OFFSET;
+    int32_t wc = 0;
+    uint32_t *words = pg_qvec_data(cont, &wc);
+    if (!words || wc < 3) return;
+    if (words[0] != PG_TL_VECTOR_ID && words[0] != PG_TL_MESSAGES_STICKER_SET
+        && words[0] != PG_TL_STAR_GIFT_UPGRADE_PREVIEW) return;
+    const uint8_t *body = (const uint8_t *)words;
+    const size_t blen = (size_t)wc * 4;
+    for (int k = 0; k < 2; k++) {
+        const uint8_t *have = NULL; size_t hl = 0;
+        if (!wanted[k] || pg_unique_captured_doc(wanted[k], &have, &hl)) continue;
+        size_t doc_off = 0, doc_len = 0;
+        if (!patchgram_tl_find_doc_by_id(body, blen, wanted[k], &doc_off, &doc_len)) continue;
+        if (doc_len == 0 || doc_off + doc_len > blen) continue;
+        pg_unique_store_doc(body, doc_off, doc_len, wanted[k]);
+    }
+}
+
+// Build the model/pattern Document for the built unique gift (mirror macOS patchgram_unique_attr_doc).
+// Prefer the real CAPTURED custom-emoji doc for `emoji_id` (renders the chosen model/symbol). Otherwise
+// fall back to a SLIM clone of the gift's OWN sticker with its id UNCHANGED (so it stays downloadable →
+// renders) but with documentAttributeSticker → documentAttributeCustomEmoji. NEVER embeds a swapped-id,
+// non-downloadable doc (that crashed tdesktop + showed nothing). Returns bytes written (0 = overflow).
+static size_t pg_unique_attr_doc(int64_t emoji_id, const uint8_t *src_doc, size_t src_len,
+                                 uint8_t *out, size_t outcap) {
+    const uint8_t *cap = NULL; size_t cap_len = 0;
+    if (emoji_id && pg_unique_captured_doc(emoji_id, &cap, &cap_len) && cap_len > 0 && cap_len <= outcap) {
+        memcpy(out, cap, cap_len);
+        return cap_len;
+    }
+    // Fallback: slim-clone the gift's own sticker (id UNCHANGED) into out, then flip its sticker attr.
+    size_t sl = pg_doc_slim(src_doc, src_len, out, outcap);
+    if (sl == 0 || sl < 16 || sl > outcap) return 0;
+    size_t sa_off = 0; uint32_t sa_flags = 0;
+    if (patchgram_tl_find_sticker_attr(out, sl, &sa_off, &sa_flags)) {
+        if (sa_off > 0 && sa_flags == 0 && sa_off + 4 <= sl) {
+            uint32_t ce = PG_TL_DOC_ATTR_CUSTOM_EMOJI_CTOR; memcpy(out + sa_off, &ce, 4);
+        }
+    }
+    return sl;
+}
+
 // Build a starGiftUnique blob into `out`. Returns byte length, 0 on overflow. `src_doc` = the regular gift's
-// sticker Document, cloned UNCHANGED as both model+pattern documents (tdesktop drops the gift if model/pattern
-// document->sticker() can't resolve, so the gift's already-cached sticker is the safe choice).
+// sticker Document. Model+pattern documents are produced by pg_unique_attr_doc (captured emoji doc if known,
+// else the gift's own sticker UNCHANGED + flipped to customEmoji — always downloadable, never crashes).
 static size_t pg_build_unique_blob(uint8_t *out, size_t outcap, const uint8_t *src_doc, size_t src_doc_len) {
-    if (src_doc_len < 16 || outcap < 256 + 2 * src_doc_len) return 0;
+    // Each model/pattern doc comes from pg_unique_attr_doc (a captured emoji doc OR a slim clone of src_doc),
+    // both capped at 4096 bytes; the surrounding fixed fields/strings fit well under 512. Require headroom for
+    // two 4096-byte docs + overhead so the (unchecked) pg_put_* word writes between them never overflow `out`.
+    if (src_doc_len < 16 || outcap < 512 + 2 * 4096) return 0;
     size_t ap = 0;
     uint32_t uflags = 0;
     if (g_unique_owner_id)         uflags |= (1u << 0);   // owner_id (Peer)
@@ -1584,20 +1706,18 @@ static size_t pg_build_unique_blob(uint8_t *out, size_t outcap, const uint8_t *s
     ap = pg_put_u32(out, ap, PG_TL_ATTR_MODEL);
     ap = pg_put_u32(out, ap, 0);                                                     // flags (crafted off)
     ap = pg_tl_put_string(out, ap, g_unique_model_name[0] ? g_unique_model_name : "Model");
-    if (ap + src_doc_len > outcap) return 0; memcpy(out + ap, src_doc, src_doc_len);
-    // Override the cloned Document.id (document#8fd4c4d8 { flags:#, id:long, ... } → id at doc+8) with the
-    // configured model emoji id, so the chosen custom emoji renders (if cached; else the attribute is dropped,
-    // never a crash). 0 = keep the gift's own sticker (always renders).
-    if (g_unique_model_emoji_id && src_doc_len >= 16) memcpy(out + ap + 8, &g_unique_model_emoji_id, 8);
-    ap += src_doc_len;
+    // model document: captured custom-emoji doc for the chosen id (renders the chosen model), else the gift's
+    // OWN sticker UNCHANGED (downloadable → renders) flipped to customEmoji. NEVER a swapped-id, undownloadable
+    // doc (that crashed tdesktop + showed nothing).
+    { size_t dl = pg_unique_attr_doc((int64_t)g_unique_model_emoji_id, src_doc, src_doc_len, out + ap, outcap - ap);
+      if (dl == 0) return 0; ap += dl; }
     ap = pg_put_u32(out, ap, PG_TL_ATTR_RARITY);
     ap = pg_put_u32(out, ap, (uint32_t)(g_unique_model_rarity ? g_unique_model_rarity : 5));
     // pattern: starGiftAttributePattern{ name, document, rarity }
     ap = pg_put_u32(out, ap, PG_TL_ATTR_PATTERN);
     ap = pg_tl_put_string(out, ap, g_unique_symbol_name[0] ? g_unique_symbol_name : "Symbol");
-    if (ap + src_doc_len > outcap) return 0; memcpy(out + ap, src_doc, src_doc_len);
-    if (g_unique_symbol_emoji_id && src_doc_len >= 16) memcpy(out + ap + 8, &g_unique_symbol_emoji_id, 8);
-    ap += src_doc_len;
+    { size_t dl = pg_unique_attr_doc((int64_t)g_unique_symbol_emoji_id, src_doc, src_doc_len, out + ap, outcap - ap);
+      if (dl == 0) return 0; ap += dl; }
     ap = pg_put_u32(out, ap, PG_TL_ATTR_RARITY);
     ap = pg_put_u32(out, ap, (uint32_t)(g_unique_symbol_rarity ? g_unique_symbol_rarity : 5));
     // backdrop: starGiftAttributeBackdrop{ name, backdrop_id, 4 colors, rarity }
@@ -1623,6 +1743,7 @@ static size_t pg_build_unique_blob(uint8_t *out, size_t outcap, const uint8_t *s
     if (ap > outcap || (ap & 3u)) return 0;
     return ap;
 }
+#define PG_UNIQUE_MAX_GIFTS 64
 static void pg_gift_unique_rebuild(void *resp) {
     if (!g_gift_unique_enabled) return;
     int32_t req_id = *(int32_t *)((const uint8_t *)resp + PG_RESPONSE_REQUEST_ID_OFFSET);
@@ -1634,54 +1755,82 @@ static void pg_gift_unique_rebuild(void *resp) {
     if (words[0] != PG_TL_SAVED_STAR_GIFTS_CTOR) return;   // cheap pre-check
     if (!pg_qvec_unshared(cont)) return;                   // COW-safe: owned buffers only
 
-    const uint8_t *body = (const uint8_t *)words;
-    const size_t old_len = (size_t)wc * 4;
-    size_t gift_off = 0, gift_len = 0, doc_off = 0, doc_len = 0;
-    if (!patchgram_tl_find_saved_gift(body, old_len, &gift_off, &gift_len, &doc_off, &doc_len)) return;
-    if (gift_off < 4 || gift_off + gift_len > old_len) return;
-    if (doc_len == 0 || doc_off + doc_len > old_len) return;
+    // Count the regular gifts (probe indices until the finder runs out). Bounded by PG_UNIQUE_MAX_GIFTS.
+    int gift_count = 0;
+    {
+        const uint8_t *body = (const uint8_t *)words;
+        const size_t len0 = (size_t)wc * 4;
+        for (int i = 0; i < PG_UNIQUE_MAX_GIFTS; i++) {
+            size_t go = 0, gl = 0, dofs = 0, dl = 0;
+            if (!patchgram_tl_find_saved_gift_n(body, len0, i, &go, &gl, &dofs, &dl)) break;
+            gift_count = i + 1;
+        }
+    }
+    if (gift_count == 0) return;
+
+    // Stash the FIRST gift's sticker doc for the fake-transfer message (unchanged single-gift behavior).
+    if (g_fake_transfer_enabled) {
+        size_t go = 0, gl = 0, dofs = 0, dl = 0;
+        if (patchgram_tl_find_saved_gift_n((const uint8_t *)words, (size_t)wc * 4, 0, &go, &gl, &dofs, &dl)
+            && dl >= 16 && dl <= sizeof g_transfer_src_doc && dofs + dl <= (size_t)wc * 4) {
+            memcpy(g_transfer_src_doc, (const uint8_t *)words + dofs, dl); g_transfer_src_doc_len = dl;
+        }
+    }
 
     static uint8_t docbuf[4096];
     static uint8_t orig_gift[16384];
     static uint8_t blob[24576];
-    if (doc_len > sizeof docbuf || gift_len > sizeof orig_gift) return;   // too big to stage safely
-    memcpy(docbuf, body + doc_off, doc_len);        // copy BEFORE any memmove/grow shifts the buffer
-    memcpy(orig_gift, body + gift_off, gift_len);   // staged copy for revert
-    if (g_fake_transfer_enabled && doc_len <= sizeof g_transfer_src_doc) {   // stash a renderable doc for the fake transfer msg
-        memcpy(g_transfer_src_doc, docbuf, doc_len); g_transfer_src_doc_len = doc_len;
-    }
-    size_t blen = pg_build_unique_blob(blob, sizeof blob, docbuf, doc_len);
-    if (blen == 0 || (blen & 3u)) return;
-
     static uint32_t logs = 0;
-    const long long delta = (long long)blen - (long long)gift_len;
-    if (delta % 4 != 0) return;
-    const int32_t new_wc = wc + (int32_t)(delta / 4);
-    if (new_wc < 4) return;
+    int rebuilt = 0;
+    // Process LAST → FIRST so each splice only shifts bytes AFTER the lower-index gifts (their offsets +
+    // regular-index stay valid). Re-find each index against the CURRENT buffer each pass (it changes length).
+    for (int idx = gift_count - 1; idx >= 0; idx--) {
+        words = pg_qvec_data(cont, &wc);
+        if (!words || wc < 4) break;
+        uint8_t *w = (uint8_t *)words;
+        const size_t cur_len = (size_t)wc * 4;
+        size_t gift_off = 0, gift_len = 0, doc_off = 0, doc_len = 0;
+        if (!patchgram_tl_find_saved_gift_n(w, cur_len, idx, &gift_off, &gift_len, &doc_off, &doc_len)) continue;
+        if (gift_off < 4 || gift_off + gift_len > cur_len) continue;
+        if (doc_len == 0 || doc_off + doc_len > cur_len) continue;
+        if (doc_len > sizeof docbuf || gift_len > sizeof orig_gift) continue;   // too big to stage safely
 
-    int32_t cap = pg_qvec_capacity(cont);
-    if (new_wc > cap) {
-        if (!pg_qvec_grow(cont, new_wc)) {
-            if (logs < 16) { logs++; pg_logf("GIFT UNIQUE skip: need %d words > cap %d, grow unavailable", new_wc, cap); }
-            return;
+        memcpy(docbuf, w + doc_off, doc_len);        // copy BEFORE any memmove/grow shifts the buffer
+        memcpy(orig_gift, w + gift_off, gift_len);   // staged copy for revert
+        size_t blen = pg_build_unique_blob(blob, sizeof blob, docbuf, doc_len);
+        if (blen == 0 || (blen & 3u)) continue;
+
+        const long long delta = (long long)blen - (long long)gift_len;
+        if (delta % 4 != 0) continue;
+        const int32_t new_wc = wc + (int32_t)(delta / 4);
+        if (new_wc < 4) continue;
+
+        int32_t cap = pg_qvec_capacity(cont);
+        if (new_wc > cap) {
+            if (!pg_qvec_grow(cont, new_wc)) {
+                if (logs < 16) { logs++; pg_logf("GIFT UNIQUE skip idx=%d: need %d words > cap %d, grow unavailable", idx, new_wc, cap); }
+                continue;
+            }
+            words = pg_qvec_data(cont, &wc);          // buffer moved → re-fetch (offsets preserved by grow)
+            if (!words) break;
+            w = (uint8_t *)words;
         }
-        words = pg_qvec_data(cont, &wc);            // buffer moved → re-fetch (offsets preserved by grow)
-        if (!words) return;
+        const size_t tail_off = gift_off + gift_len;
+        const size_t tail_len = cur_len - tail_off;
+        memmove(w + gift_off + blen, w + tail_off, tail_len);   // open/close the gap by `delta`
+        memcpy(w + gift_off, blob, blen);                       // drop the rebuilt starGiftUnique in
+        if (!patchgram_tl_validate_top(w, (size_t)new_wc * 4, PG_TL_SAVED_STAR_GIFTS_CTOR)) {
+            memmove(w + gift_off + gift_len, w + gift_off + blen, tail_len);  // slide tail back
+            memcpy(w + gift_off, orig_gift, gift_len);                        // restore the original starGift
+            if (logs < 16) { logs++; pg_logf("GIFT UNIQUE skip idx=%d: rebuilt response failed validation", idx); }
+            continue;
+        }
+        pg_qvec_set_size(cont, new_wc);                         // publish only after validation passes
+        rebuilt++;
+        if (logs < 16) { logs++; pg_logf("GIFT UNIQUE rebuilt idx=%d gift [%zu,%zu) -> %zu bytes (%d words, cap=%d)",
+                                         idx, gift_off, tail_off, blen, new_wc, cap); }
     }
-    uint8_t *w = (uint8_t *)words;
-    const size_t tail_off = gift_off + gift_len;
-    const size_t tail_len = old_len - tail_off;
-    memmove(w + gift_off + blen, w + tail_off, tail_len);   // open/close the gap by `delta`
-    memcpy(w + gift_off, blob, blen);                       // drop the rebuilt starGiftUnique in
-    if (!patchgram_tl_validate_top(w, (size_t)new_wc * 4, PG_TL_SAVED_STAR_GIFTS_CTOR)) {
-        memmove(w + gift_off + gift_len, w + gift_off + blen, tail_len);  // slide tail back to original place
-        memcpy(w + gift_off, orig_gift, gift_len);                        // restore the original starGift
-        if (logs < 16) { logs++; pg_logf("GIFT UNIQUE skip: rebuilt response failed validation"); }
-        return;
-    }
-    pg_qvec_set_size(cont, new_wc);                         // publish only after validation passes
-    if (logs < 16) { logs++; pg_logf("GIFT UNIQUE rebuilt gift [%zu,%zu) -> %zu bytes (%d words, cap=%d)",
-                                     gift_off, tail_off, blen, new_wc, cap); }
+    if (logs < 16 && rebuilt > 0) { logs++; pg_logf("GIFT UNIQUE rebuilt %d/%d gift(s)", rebuilt, gift_count); }
 }
 
 // ---- unique gift "last resale" value info: answer payments.getUniqueStarGiftValueInfo with our values ----
@@ -1798,6 +1947,33 @@ static void pg_fake_transfer(void *resp) {
     if (!pg_qvec_replace(cont, (const uint32_t*)built, wc)) return;
     if (logs < 16) { logs++; pg_logf("FAKE TRANSFER substituted requestId=%d words=%d", request_id, wc); }
 }
+// Fake transfer (cont.): the client gates the transferStarGift send on a successful getPaymentForm. For a
+// gift the server doesn't treat as a paid transfer it answers rpc_error "STARGIFT_NOT_UNIQUE" and the
+// client aborts the flow — so the transferStarGift we fake never gets sent. Rewrite that error in place to
+// "NO_PAYMENT_NEEDED" (the well-known "no charge, proceed" sentinel) so the client skips the payment step
+// and goes straight to sending the transfer (which pg_fake_transfer then fabricates a reply for). Same span:
+// "STARGIFT_NOT_UNIQUE"(19) and "NO_PAYMENT_NEEDED"(17) both pad to 20 bytes, so the buffer length is
+// unchanged. Mirrors the macOS patchgram_apply_transfer_form_response.
+static void pg_transfer_form(void *resp) {
+    if (!g_fake_transfer_enabled) return;
+    int32_t request_id = *(int32_t*)((const uint8_t*)resp + PG_RESPONSE_REQUEST_ID_OFFSET);
+    if (!pg_ring_take(g_transfer_form_ring, request_id)) return;
+    int32_t wc = 0;
+    uint32_t *words = pg_qvec_data((const uint8_t*)resp + PG_RESPONSE_REPLY_OFFSET, &wc);
+    if (!words || wc < 3 || words[0] != PG_TL_RPC_ERROR) return;       // only the rpc_error reply
+    if (!pg_qvec_unshared((const uint8_t*)resp + PG_RESPONSE_REPLY_OFFSET)) return;  // never edit a shared buffer
+    uint8_t *b = (uint8_t*)words; const size_t bytelen = (size_t)wc * 4;
+    size_t moff = 8, mend = 8;                                          // error_message:string starts at byte 8
+    if (!pg_tl_skip_string(b, bytelen, &mend)) return;
+    const size_t old_span = mend - moff;
+    const char *msg = "NO_PAYMENT_NEEDED";
+    size_t need = 1 + strlen(msg); need += ((4 - (need & 3)) & 3);      // 1-byte len prefix + body, padded to 4
+    if (need > old_span) return;                                        // never grow the buffer
+    pg_tl_put_string(b, moff, msg);
+    if (old_span > need) memset(b + moff + need, 0, old_span - need);   // keep the object well-formed
+    static uint32_t logs = 0;
+    if (logs < 16) { logs++; pg_logf("FAKE TRANSFER form rewrite requestId=%d STARGIFT_NOT_UNIQUE->NO_PAYMENT_NEEDED", request_id); }
+}
 
 void pg_apply_response(void *resp) {
     if (!resp) return;
@@ -1807,15 +1983,50 @@ void pg_apply_response(void *resp) {
     pg_disable_monetization(resp);
     pg_gift_spoof(resp);
     pg_gift_extras(resp);          // caption/auction/transfer-button (regular gift) — before the unique rebuild
+    pg_unique_capture(resp);       // cache real model/symbol custom-emoji docs as they flow by (for rendering)
     pg_gift_unique_rebuild(resp);
     pg_value_info(resp);
+    pg_transfer_form(resp);        // rewrite getPaymentForm STARGIFT_NOT_UNIQUE error so the transfer proceeds
     pg_fake_transfer(resp);
     pg_inject_hidden_gifts(resp);
     pg_fragment_phone(resp);
     pg_cu_collectible(resp);
     pg_fact_check(resp);
     pg_custom_usernames(resp);
-    // TODO(port): fake transfer — see NOTES.md §7 for the remaining map.
+}
+
+// ---- Pack auto-load (dynamic, BY EMOJI ID): load the gift model/symbol packs from the configured ids -------
+// The unique-gift PATTERN renders via the client's customEmojiManager, which needs the chosen custom-emoji
+// DOCUMENT loaded; the client fetches docs by id with messages.getCustomEmojiDocuments and then — per its own
+// behaviour (verified in the trace: a getCustomEmojiDocuments is followed by a burst of getStickerSet for the
+// returned docs' sets) — loads each doc's FULL sticker set (the doc carries documentAttributeCustomEmoji
+// .stickerset = inputStickerSetID). So we APPEND the configured model/symbol emoji ids to the first
+// getCustomEmojiDocuments the client sends: the client then pulls in those exact emoji + their full packs, with
+// NO hardcoded short-names and working for whatever model/symbol the user picked. The reply also flows through
+// pg_unique_capture (renderable doc for our built gift). One append per session.
+#define PG_TL_GET_CUSTOM_EMOJI_DOCS 0xd9ab0f54u   // messages.getCustomEmojiDocuments{ document_id:Vector<long> }
+static int g_autoload_done = 0;                   // appended our ids to a getCustomEmojiDocuments yet
+// Append `n` emoji document ids to the END of a getCustomEmojiDocuments request's document_id:Vector<long>
+// (the vector is the body's last field, so we just append + bump the count word — no tail to shift) and grow
+// the Qt5 request buffer COW-safely. The client fetches its own ids PLUS ours; the reply carries N+n docs
+// (tdesktop maps them by id, so the extra ones are simply stored). Returns 1 on success.
+static int pg_autoload_append_emoji(uint8_t *rdata, const int64_t *ids, int n) {
+    if (n <= 0) return 0;
+    const void *cont = rdata + PG_REQUEST_DATA_BUFFER_OFFSET;
+    if (!pg_qvec_unshared(cont)) return 0;
+    int32_t wc = 0; uint32_t *w = pg_qvec_data(cont, &wc);
+    if (!w || wc <= PG_SERIALIZED_REQUEST_BODY_POSITION + 3) return 0;   // need ctor+vector+count present
+    int32_t new_wc = wc + n * 2;                                         // each long = 2 words
+    if (new_wc > pg_qvec_capacity(cont) && !pg_qvec_grow(cont, new_wc)) return 0;  // grow may move the buffer
+    w = pg_qvec_data(cont, &wc);                                         // re-fetch after grow
+    if (!w || new_wc > pg_qvec_capacity(cont)) return 0;
+    uint8_t *end = (uint8_t *)(w + wc);                                  // append right after the last existing id
+    size_t ap = 0;
+    for (int i = 0; i < n; i++) ap = pg_put_i64(end, ap, ids[i]);
+    w[PG_SERIALIZED_REQUEST_BODY_POSITION + 2] += (uint32_t)n;           // bump the Vector<long> count
+    pg_qvec_set_size(cont, new_wc);                                      // publish the new request length
+    w[7] = (uint32_t)((new_wc - PG_SERIALIZED_REQUEST_BODY_POSITION) * 4); // message_data_length (re-stamped at send)
+    return 1;
 }
 
 // Request-side patches (no IDA — operate on the serialized TL body at word kMessageBodyPosition=8).
@@ -1888,6 +2099,16 @@ int pg_apply_request(void *req) {
                 if (logs < 64) { logs++; pg_logf("FAKE TRANSFER tracked req=%d peer_type=%d", request_id, pt); }
             }
         }
+    }
+    // Fake transfer (cont.): track every getPaymentForm#37148dbb whose invoice is inputInvoiceStarGiftTransfer
+    // so pg_transfer_form can rewrite the STARGIFT_NOT_UNIQUE error its response may carry. Forward as normal.
+    // body = { ctor:getPaymentForm, flags:int, invoice:InputInvoice, ... } → the invoice ctor is body[2].
+    if (g_fake_transfer_enabled && ctor == PG_TL_GET_PAYMENT_FORM && bodyN >= 3
+            && body[2] == PG_TL_INPUT_INVOICE_SGT) {
+        int32_t request_id = *(int32_t*)(rdata + PG_REQUEST_DATA_REQUEST_ID_OFFSET);
+        pg_ring_track(g_transfer_form_ring, request_id);
+        static uint32_t logs = 0;
+        if (logs < 64) { logs++; pg_logf("FAKE TRANSFER form tracked req=%d (getPaymentForm/starGiftTransfer)", request_id); }
     }
     // Fragment phone: remember every fragment.getCollectibleInfo (phone) requestId so the response ring
     // answers it (must answer EVERY tap or the collectible-phone row null-derefs). Forward as normal
@@ -1991,6 +2212,35 @@ int pg_apply_request(void *req) {
                                 || ctor == 0x5821a5dcu || ctor == 0xb4352016u || ctor == 0x5774ca74u)) {
         if (logs < 64) { logs++; pg_logf("HIDE STORIES: dropped request ctor=%#x", ctor); }
         return 1;
+    }
+    // Pack auto-load (MUST be last: the append may realloc the request buffer, invalidating `words`/`body`).
+    // Append the configured model/symbol emoji ids to the first getCustomEmojiDocuments so the client fetches
+    // them + their full packs by id (see helper above). One-shot per session.
+    if ((g_gift_unique_enabled || g_gift_spoof_enabled || g_show_hidden_gifts_enabled)
+            && !g_autoload_done && ctor == PG_TL_GET_CUSTOM_EMOJI_DOCS
+            && bodyN >= 3 && body[1] == PG_TL_VECTOR_ID) {
+        // Gather the custom-emoji ids every ENABLED gift feature embeds/references, so their docs+packs load:
+        //  - unique gifts: the built starGiftUnique's model + symbol attribute docs;
+        //  - spoof gifts: the gift's overwritten sticker doc id (kept its old access_hash, so it only renders
+        //    once that emoji is cached by id);
+        //  - hidden gifts: each injected gift's referenced emoji (loads upfront instead of on first scroll).
+        int64_t ids[3 + PG_MAX_HIDDEN_GIFTS]; int n = 0;
+        const int cap = (int)(sizeof ids / sizeof ids[0]);
+        if (g_gift_unique_enabled) {
+            if (g_unique_model_emoji_id  && n < cap) ids[n++] = (int64_t)g_unique_model_emoji_id;
+            if (g_unique_symbol_emoji_id && n < cap) ids[n++] = (int64_t)g_unique_symbol_emoji_id;
+        }
+        if (g_gift_spoof_enabled && g_gift_spoof_sticker_id && n < cap) ids[n++] = g_gift_spoof_sticker_id;
+        if (g_show_hidden_gifts_enabled) {
+            for (int i = 0; i < g_hidden_gift_count && n < cap; i++)
+                if (g_hidden_emoji_ids[i]) ids[n++] = g_hidden_emoji_ids[i];
+        }
+        if (n > 0 && pg_autoload_append_emoji(rdata, ids, n)) {
+            g_autoload_done = 1;
+            if (logs < 64) { logs++; pg_logf("PACK AUTOLOAD appended %d emoji id(s) to getCustomEmojiDocuments "
+                                             "(unique=%d spoof=%d hidden=%d)", n,
+                                             g_gift_unique_enabled, g_gift_spoof_enabled, g_show_hidden_gifts_enabled); }
+        }
     }
     return 0;
 }

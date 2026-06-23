@@ -32,10 +32,10 @@ class AppState extends ChangeNotifier {
   final Map<String, Object> cfg = {'mtprotoLoggerEnabled': true};
 
   bool autoCheckUpdates = true;   // "check for updates on launch" (default on, like macOS), persisted
-  // Patcher version + build — keep in sync with pubspec.yaml `version: 1.0.0+10`. Shown in About + the
-  // GitHub update check, so it's a real version (not decoration): "Version 1.0.0 (10)".
-  static const appVersion = '1.0.0';
-  static const appBuild = '10';
+  // Patcher version + build — keep in sync with pubspec.yaml `version: 1.0.1+11`. Shown in About + the
+  // GitHub update check, so it's a real version (not decoration): "Version 1.0.1 (11)".
+  static const appVersion = '1.0.1';
+  static const appBuild = '11';
   static const _version = appVersion;
 
   AppState() { _guessPaths(); _loadSettings(); load(); _readAppInfo();
