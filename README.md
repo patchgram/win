@@ -14,7 +14,8 @@ The patcher groups patches into five sections. Each row links to the code that i
 behavior lives in the injected DLL: MTProto request/response rewriters in
 [`dll/engine_patches.c`](dll/engine_patches.c) and the two hooks + reversible byte-patch (AOB) engine in
 [`dll/patchgram.cpp`](dll/patchgram.cpp). Plain-language descriptions of every patch are in
-[patchlist.md](patchlist.md) ([RU](patchlist_ru.md)).
+[patchlist.md](patchlist.md) ([RU](patchlist_ru.md)). To author a new patch (Windows ABI/Qt5 specifics,
+how to find sites, write/build a patch, tools), see [docs/patch-authoring.md](docs/patch-authoring.md).
 
 > Code links are pinned to commit [`b617126`](https://github.com/patchgram/win/tree/b617126) so the line
 > numbers stay valid as the DLL evolves. `dll` patches = a runtime rewriter / hook; `binary` patches = an
